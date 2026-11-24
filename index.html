@@ -1,0 +1,2228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta name="hive-firebase" content="https://bee-monitor-7c9ce-default-rtdb.firebaseio.com/hive01">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hive bench monitor</title>
+<!--
+  Hive bench monitor: live dashboard for the hive node (design.md §11).
+
+  Single file. External dependencies are pinned CDN versions with SRI hashes:
+    uPlot 1.6.32   (charts; loaded eagerly)
+    MQTT.js 5.16.1 (loaded lazily, only when the MQTT source is selected)
+
+  Layout of the script:
+    1. HIVE-CORE: pure, DOM-free protocol logic (frame parser, line splitter,
+       seq tracker, CSV, chart-series builder). test/parser.test.mjs extracts
+       this block by its BEGIN/END markers and runs it under Node, so there is
+       exactly one copy of the parser. Keep it DOM-free.
+    2. Sources: SerialSource (Web Serial), MqttSource (UNTESTED), FirebaseSource
+       (public read-only mode, only with <meta name="hive-firebase">), SimSource
+       (?demo=1). All emit the same events; nothing downstream knows which
+       one is active.
+    3. App: store, tiles, link stats, charts, console, CSV export.
+-->
+<link rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.min.css"
+      integrity="sha384-IfV0B7MIOYuO95kO9G5ySKPz/85zqFNOAs8iy4tkK5zd9izhJAB8b7lHrwYqqmYE"
+      crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.iife.min.js"
+        integrity="sha384-Gx3t0zdBAuQOuvvmaLZj7HKEiSgWTAs+VdtNY7wt19QDPTDQjFIwAuXDj0zeN00c"
+        crossorigin="anonymous"></script>
+<style>
+/* Palette: dataviz reference palette. Categorical slot 1 (blue) = in-hive,
+   slot 2 (orange) = ambient. Validated with validate_palette.js in both modes
+   (adjacent CVD dE 24.7 light / 26.8 dark, all checks PASS). CO2 is also an
+   in-hive measurand, so it wears slot 1: colour follows the entity. */
+.viz-root {
+  color-scheme: light;
+  --page:           #f9f9f7;
+  --surface-1:      #fcfcfb;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --grid:           #e1e0d9;
+  --axis:           #c3c2b7;
+  --border:         rgba(11,11,11,0.10);
+  --wash:           rgba(11,11,11,0.04);
+  --series-1:       #2a78d6;
+  --series-2:       #eb6834;
+  --reboot:         rgba(82,81,78,0.55);
+  /* Status palette: fixed, never themed, always paired with icon + label. */
+  --good:     #0ca30c;
+  --warning:  #fab219;
+  --serious:  #ec835a;
+  --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --axis:           #383835;
+    --border:         rgba(255,255,255,0.10);
+    --wash:           rgba(255,255,255,0.05);
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --reboot:         rgba(195,194,183,0.55);
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --page:           #0d0d0d;
+  --surface-1:      #1a1a19;
+  --text-primary:   #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #898781;
+  --grid:           #2c2c2a;
+  --axis:           #383835;
+  --border:         rgba(255,255,255,0.10);
+  --wash:           rgba(255,255,255,0.05);
+  --series-1:       #3987e5;
+  --series-2:       #d95926;
+  --reboot:         rgba(195,194,183,0.55);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page);
+  color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.wrap { max-width: 1280px; margin: 0 auto; padding: 16px 20px 40px; }
+h1 { font-size: 18px; font-weight: 600; margin: 0; }
+h2 { font-size: 14px; font-weight: 600; margin: 0; }
+.sub { color: var(--text-secondary); font-size: 12px; }
+.muted { color: var(--text-muted); }
+button, select, input {
+  font: inherit; color: var(--text-primary);
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 10px;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled) { background: var(--wash); }
+button:disabled, input:disabled { opacity: .45; cursor: default; }
+button.primary { border-color: var(--series-1); }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px;
+}
+
+/* Header */
+.top { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.top .title { display: flex; gap: 12px; align-items: center; }
+.top .conn { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary);
+        border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); flex: none; }
+.dot.good { background: var(--good); } .dot.warning { background: var(--warning); }
+.dot.serious { background: var(--serious); } .dot.critical { background: var(--critical); }
+
+.banner { border-left: 3px solid var(--serious); padding: 8px 12px; margin-bottom: 12px; }
+.cfg { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: end; margin-bottom: 12px; }
+.cfg label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-secondary); }
+.cfg input { min-width: 220px; }
+.untested { font-size: 12px; color: var(--text-secondary); border-left: 3px solid var(--warning); padding-left: 8px; flex-basis: 100%; }
+
+/* Filter row: one row, above everything it scopes */
+.filters { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 4px 0 12px; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; border-right: 1px solid var(--border); }
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed="true"] { background: var(--wash); font-weight: 600; }
+.filters .spacer { flex: 1; }
+.filters label { color: var(--text-secondary); font-size: 12px; display: inline-flex; gap: 6px; align-items: center; }
+
+/* Tiles */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.tile .label { color: var(--text-secondary); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.tile .key { width: 12px; height: 2px; border-radius: 1px; }
+.tile .value { font-size: 30px; font-weight: 600; line-height: 1.15; margin: 4px 0 2px; }
+.tile .value .unit { font-size: 14px; font-weight: 400; color: var(--text-secondary); margin-left: 4px; }
+.tile .note { font-size: 12px; color: var(--text-muted); min-height: 18px; display: flex; align-items: center; gap: 6px; }
+.tile.stale .value { opacity: .4; }
+.tile.stale { border-color: color-mix(in srgb, var(--warning) 60%, transparent); }
+.chip { display: inline-flex; align-items: center; gap: 5px; color: var(--text-secondary); }
+.chip .icon { font-size: 12px; line-height: 1; }
+
+/* Link stats */
+.stats { margin-bottom: 10px; }
+.stats .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px 16px; margin-top: 8px; }
+.stat .k { font-size: 12px; color: var(--text-secondary); }
+.stat .v { font-size: 18px; font-weight: 600; }
+.stat .v.bad { display: flex; align-items: center; gap: 6px; }
+
+/* Charts */
+.charts { display: grid; grid-template-columns: 1fr; gap: 10px; margin-bottom: 10px; }
+@media (min-width: 1000px) { .charts { grid-template-columns: 1fr 1fr; } .charts .wide { grid-column: 1 / -1; } }
+.chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 6px; flex-wrap: wrap; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-secondary); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 14px; height: 2px; border-radius: 1px; }
+.legend i.reboot { width: 1px; height: 12px; background: var(--reboot); }
+.chart { position: relative; width: 100%; }
+.uplot { font-family: inherit; }
+.tip {
+  position: absolute; pointer-events: none; z-index: 5; display: none;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 6px 10px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.12); white-space: nowrap;
+}
+.tip .t { color: var(--text-muted); margin-bottom: 2px; font-variant-numeric: tabular-nums; }
+.tip .row { display: flex; align-items: center; gap: 8px; }
+.tip .row i { width: 12px; height: 2px; border-radius: 1px; display: inline-block; }
+.tip .row b { font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.tip .row span { color: var(--text-secondary); }
+.nolib { padding: 30px; text-align: center; color: var(--text-muted); }
+
+/* Console + commands */
+.cmd { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+.cmd input { flex: 1; min-width: 160px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.hint { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+details > summary { cursor: pointer; font-weight: 600; }
+details > summary .sub { font-weight: 400; margin-left: 6px; }
+.console {
+  margin-top: 8px; height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+}
+.console .ln .ts { color: var(--text-muted); margin-right: 8px; }
+.console .ln.tx   { color: var(--series-1); }
+.console .ln.info { color: var(--text-muted); font-style: italic; }
+.console .ln.err  { color: var(--critical); }
+.console .ln.frame { color: var(--text-secondary); }
+.console-opts { display: flex; gap: 14px; font-size: 12px; color: var(--text-secondary); margin-top: 6px; align-items: center; }
+
+/* Table view */
+table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
+th, td { text-align: right; padding: 3px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+th { color: var(--text-secondary); font-weight: 600; }
+th:first-child, td:first-child { text-align: left; }
+.tablewrap { max-height: 340px; overflow: auto; }
+
+.section { margin-bottom: 10px; }
+footer { font-size: 12px; color: var(--text-muted); margin-top: 14px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* Public mode (meta hive-firebase): read-only. No source choice, no commands,
+   no MQTT settings, no serial/interval controls; the feed's history can't be cleared. */
+body.public-mode label[for="srcSel"], body.public-mode #srcSel,
+body.public-mode #connectBtn, body.public-mode #disconnectBtn,
+body.public-mode #mqttCfg, body.public-mode #cmdForm, body.public-mode .hint,
+body.public-mode #intervalSel, body.public-mode label:has(> #intervalSel),
+body.public-mode #clearBtn { display: none !important; }
+#agePill { display: none; }   /* .pill sets display, which would beat [hidden] */
+body.public-mode #agePill { display: inline-flex; }
+</style>
+</head>
+<body class="viz-root">
+<div class="wrap">
+
+<header class="top">
+  <div class="title">
+    <h1>Hive bench monitor</h1>
+    <span class="pill" id="srcPill"><span class="dot" id="srcDot"></span><span id="srcText">Not connected</span></span>
+    <span class="pill" id="agePill"><span class="dot" id="ageDot"></span><span id="ageText"></span></span>
+  </div>
+  <div class="conn">
+    <label class="sub" for="srcSel">Source</label>
+    <select id="srcSel">
+      <option value="serial">USB serial (Web Serial)</option>
+      <option value="mqtt">MQTT over WebSocket (untested)</option>
+      <option value="sim" id="simOpt" hidden>Simulated (demo)</option>
+    </select>
+    <button id="connectBtn" class="primary">Connect…</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
+    <select id="themeSel" aria-label="Theme">
+      <option value="auto">Theme: auto</option>
+      <option value="light">Theme: light</option>
+      <option value="dark">Theme: dark</option>
+    </select>
+    <select id="unitSel" aria-label="Temperature unit">
+      <option value="F">°F</option>
+      <option value="C">°C</option>
+    </select>
+  </div>
+</header>
+
+<div id="banner" class="card banner" hidden></div>
+
+<section id="mqttCfg" class="card cfg" hidden>
+  <label>Broker WebSocket URL<input id="mqttUrl" placeholder="ws://192.168.1.10:9001"></label>
+  <label>Topic prefix<input id="mqttPrefix" placeholder="beehive/hive01"></label>
+  <label>Username (optional)<input id="mqttUser" autocomplete="off"></label>
+  <label>Password (optional)<input id="mqttPass" type="password" autocomplete="off"></label>
+  <div class="untested">UNTESTED: no broker exists yet. Subscribes to <code>&lt;prefix&gt;/#</code> and assembles one record per burst of §11.6 per-measurand topics. MQTT carries no <code>seq</code>, so dropped-frame counting is unavailable on this source.</div>
+</section>
+
+<div class="filters" role="toolbar" aria-label="Chart range and export">
+  <label>Range</label>
+  <div class="seg" id="rangeSeg">
+    <button data-range="900">15 min</button>
+    <button data-range="3600">1 h</button>
+    <button data-range="21600">6 h</button>
+    <button data-range="86400">24 h</button>
+    <button data-range="0">All</button>
+  </div>
+  <label>Expected frame interval
+    <select id="intervalSel">
+      <option value="1000">1 s (demo)</option>
+      <option value="10000">10 s (bench)</option>
+      <option value="60000">60 s (production)</option>
+    </select>
+  </label>
+  <span class="spacer"></span>
+  <span class="sub" id="histCount">0 records</span>
+  <button id="csvBtn">Export CSV</button>
+  <button id="clearBtn">Clear history</button>
+</div>
+
+<section class="tiles" id="tiles"></section>
+
+<section class="card stats">
+  <h2>Link</h2>
+  <div class="grid" id="statsGrid"></div>
+</section>
+
+<section class="charts">
+  <div class="card wide">
+    <div class="chart-head"><h2>Scale, raw counts <span class="sub">HX711 · gain 128 · no tare or kg conversion in the firmware</span></h2>
+      <div class="legend"><span><i class="reboot"></i>Reboot</span></div></div>
+    <div class="sub" style="display:flex;gap:12px;align-items:center;margin:2px 0 8px">
+      <button id="tareBtn" title="Mark the latest reading as zero for the Δ readout (kept in this page only)">Tare</button>
+      <span id="scaleDelta">—</span>
+    </div>
+    <div class="chart" id="chartScale"></div>
+  </div>
+  <div class="card wide">
+    <div class="chart-head"><h2>CO₂, in-hive <span class="sub">ppm · SCD-30</span></h2>
+      <div class="legend"><span><i class="reboot"></i>Reboot</span></div></div>
+    <div class="chart" id="chartCo2"></div>
+  </div>
+  <div class="card">
+    <div class="chart-head"><h2>Temperature <span class="sub" id="tempUnitHead">°F</span></h2>
+      <div class="legend"><span><i style="background:var(--series-1)"></i>In-hive (SCD-30)</span><span><i style="background:var(--series-2)"></i>Ambient (DHT22)</span><span><i class="reboot"></i>Reboot</span></div></div>
+    <div class="chart" id="chartTemp"></div>
+  </div>
+  <div class="card">
+    <div class="chart-head"><h2>Relative humidity <span class="sub">%</span></h2>
+      <div class="legend"><span><i style="background:var(--series-1)"></i>In-hive (SCD-30)</span><span><i style="background:var(--series-2)"></i>Ambient (DHT22)</span><span><i class="reboot"></i>Reboot</span></div></div>
+    <div class="chart" id="chartRh"></div>
+  </div>
+</section>
+
+<section class="card section">
+  <h2 id="cmdTitle">Commands</h2>
+  <form class="cmd" id="cmdForm" autocomplete="off">
+    <input id="cmdInput" placeholder="t · ? · p 1 · p 0 · f 425 · y" aria-label="Command to send" disabled>
+    <button type="submit" id="cmdSend" disabled>Send</button>
+    <button type="button" class="quick" data-cmd="t" disabled>t (diag)</button>
+    <button type="button" class="quick" data-cmd="?" disabled>? (help)</button>
+    <button type="button" class="quick" data-cmd="p 1" disabled>p 1 (stream on)</button>
+  </form>
+  <div class="hint">SCD-30 forced recalibration: <strong>after <code>f &lt;ppm&gt;</code>, send <code>y</code> within 30 s.</strong> Any other line cancels the pending FRC and is not run. The dashboard sends <code>p 1</code> only once, on connect. There is deliberately no one-click button for that. Commands are sent with a trailing <code>\n</code>.</div>
+  <details id="consoleDetails" style="margin-top:10px">
+    <summary>Raw console <span class="sub" id="consoleCount">non-frame lines, sent commands, rejected frames</span></summary>
+    <div class="console-opts">
+      <label><input type="checkbox" id="showFrames"> also show valid frames</label>
+      <label><input type="checkbox" id="autoScroll" checked> auto-scroll</label>
+      <button type="button" id="consoleClear">Clear</button>
+    </div>
+    <div class="console" id="console" role="log" aria-live="off"></div>
+  </details>
+</section>
+
+<details class="card section">
+  <summary>Table view <span class="sub">last 50 records, newest first</span></summary>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Time</th><th>seq</th><th>CO₂ ppm</th><th>T in <span class="tu">°F</span></th><th>RH in %</th><th>T out <span class="tu">°F</span></th><th>RH out %</th><th>raw counts</th><th>flags</th></tr></thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+</details>
+
+<footer id="footer"></footer>
+</div>
+
+<script>
+'use strict';
+
+// ==== BEGIN HIVE-CORE ====
+// Pure protocol logic. No DOM, no globals beyond TextDecoder. Extracted by
+// test/parser.test.mjs; anything added here must run under plain Node.
+
+/** flags bits, design.md §11.1 */
+const FLAG = Object.freeze({
+  SCD30_FAIL: 0x01,
+  DHT22_FAIL: 0x02,
+  HX711_FAIL: 0x04,   // timeout/absent; always set on the bench (no scale fitted)
+  POWER_ON:   0x08,   // first frame after a reset (§11.5)
+});
+
+const SEQ_MOD = 65536;          // seq is uint16 and wraps
+// Upper bound on a forward seq jump we will believe is "frames lost" rather
+// than an unflagged reset. 4096 frames is 11 h at 10 s. Tightened further by
+// wall-clock elapsed time when that is available (see SeqTracker.update).
+const MAX_PLAUSIBLE_GAP = 4096;
+
+/** NMEA-style checksum: XOR of every char code between '$' and '*'. */
+function xorChecksum(body) {
+  let cs = 0;
+  for (let i = 0; i < body.length; i++) cs ^= body.charCodeAt(i);
+  return cs;
+}
+
+const RE_NUM  = /^-?\d+(\.\d+)?$/;
+const RE_INT  = /^-?\d+$/;
+const RE_FLAGS = /^(0[xX])?[0-9A-Fa-f]{1,2}$/;
+const RE_CS   = /^[0-9A-Fa-f]{2}$/;
+// dtostrf() prints "nan"/"inf" for non-finite floats; treat those as a failed
+// read rather than a malformed frame (the checksum already proved integrity).
+const RE_NONFINITE = /^(-?inf|nan|ovf)$/i;
+
+/**
+ * Apply failure semantics shared by every source. Sentinels (co2 -1,
+ * T/RH -999) become null. A set fail flag also nulls that sensor's fields:
+ * if the firmware says the read failed, any number alongside it is not data
+ * we want plotted. `raw` fields may be number|null|undefined.
+ */
+function normaliseValues(raw) {
+  const flags = (raw.flags === undefined || raw.flags === null) ? null : raw.flags;
+  const sentinel = (v, s) => (v === undefined || v === null || !Number.isFinite(v) || v === s) ? null : v;
+  const rec = {
+    co2:       sentinel(raw.co2, -1),
+    tIn:       sentinel(raw.tIn, -999),
+    rhIn:      sentinel(raw.rhIn, -999),
+    tOut:      sentinel(raw.tOut, -999),
+    rhOut:     sentinel(raw.rhOut, -999),
+    rawCounts: (raw.rawCounts === undefined || raw.rawCounts === null || !Number.isFinite(raw.rawCounts)) ? null : raw.rawCounts,
+    flags,
+  };
+  if (flags !== null) {
+    if (flags & FLAG.SCD30_FAIL) { rec.co2 = null; rec.tIn = null; rec.rhIn = null; }
+    if (flags & FLAG.DHT22_FAIL) { rec.tOut = null; rec.rhOut = null; }
+    if (flags & FLAG.HX711_FAIL) { rec.rawCounts = null; }
+  }
+  return rec;
+}
+
+function parseMeasurand(text) {
+  if (RE_NONFINITE.test(text)) return { ok: true, v: null };
+  if (!RE_NUM.test(text)) return { ok: false };
+  return { ok: true, v: Number(text) };
+}
+
+/**
+ * Parse one line (no terminator required; trailing CR/LF/space is ignored).
+ * Returns one of:
+ *   { kind: 'not-frame' }                          line has no "$HIVE,"
+ *   { kind: 'bad-checksum', reason }               integrity failure
+ *   { kind: 'malformed', reason }                  checksum OK (or absent) but fields wrong
+ *   { kind: 'frame', frame: {seq, co2, tIn, rhIn, tOut, rhOut, rawCounts, flags} }
+ */
+function parseHiveLine(line) {
+  // Search rather than require index 0: after an Uno reset, or with idle
+  // noise on RS-485 (§6.5), junk bytes can precede '$' on the same line. The
+  // checksum is what makes accepting such a line safe.
+  const start = line.indexOf('$HIVE,');
+  if (start < 0) return { kind: 'not-frame' };
+  const s = line.slice(start).replace(/[\s]+$/, '');
+  const star = s.lastIndexOf('*');
+  if (star < 0) return { kind: 'malformed', reason: 'no * checksum delimiter' };
+  const body = s.slice(1, star);
+  const csText = s.slice(star + 1);
+  if (!RE_CS.test(csText)) return { kind: 'malformed', reason: 'checksum is not 2 hex digits' };
+  // Non-printable/non-ASCII inside the body is line corruption; count it as
+  // an integrity failure rather than trusting an XOR that might collide.
+  if (/[^\x20-\x7e]/.test(body)) return { kind: 'bad-checksum', reason: 'non-ASCII byte in frame' };
+  const want = parseInt(csText, 16);
+  const got = xorChecksum(body);
+  if (want !== got) {
+    return { kind: 'bad-checksum', reason: `checksum ${csText.toUpperCase()} != computed ${got.toString(16).toUpperCase().padStart(2, '0')}` };
+  }
+
+  const f = body.split(',');
+  if (f.length !== 9) return { kind: 'malformed', reason: `expected 9 fields, got ${f.length}` };
+  if (f[0] !== 'HIVE') return { kind: 'malformed', reason: 'bad talker' };
+
+  if (!RE_INT.test(f[1])) return { kind: 'malformed', reason: 'seq not an integer' };
+  const seq = Number(f[1]);
+  if (seq < 0 || seq >= SEQ_MOD) return { kind: 'malformed', reason: 'seq out of uint16 range' };
+
+  const names = ['co2', 'tIn', 'rhIn', 'tOut', 'rhOut'];
+  const raw = {};
+  for (let i = 0; i < names.length; i++) {
+    const m = parseMeasurand(f[2 + i]);
+    if (!m.ok) return { kind: 'malformed', reason: `${names[i]} not numeric: "${f[2 + i]}"` };
+    raw[names[i]] = m.v;
+  }
+
+  if (!RE_INT.test(f[7])) return { kind: 'malformed', reason: 'raw_counts not an integer' };
+  raw.rawCounts = Number(f[7]);
+  if (raw.rawCounts < -2147483648 || raw.rawCounts > 2147483647) return { kind: 'malformed', reason: 'raw_counts out of int32 range' };
+
+  if (!RE_FLAGS.test(f[8])) return { kind: 'malformed', reason: 'flags not a hex byte' };
+  raw.flags = parseInt(f[8].replace(/^0[xX]/, ''), 16);
+
+  const v = normaliseValues(raw);
+  return { kind: 'frame', frame: { seq, ...v } };
+}
+
+/**
+ * Byte-stream line splitter. Web Serial delivers arbitrary chunks, so a line
+ * (or a CRLF pair) can straddle reads. Both CR and LF terminate; empty lines
+ * are dropped, which also swallows the LF of CRLF. Each line is decoded on
+ * its own so a multi-byte UTF-8 char (the firmware prints em dashes) is never
+ * split across chunks. A line longer than maxLen (e.g. baud mismatch garbage
+ * with no newline) is flagged and discarded up to the next terminator, so the
+ * buffer is bounded.
+ */
+class LineSplitter {
+  constructor(maxLen = 512) {
+    this.maxLen = maxLen;
+    this.buf = new Uint8Array(maxLen);
+    this.n = 0;
+    this.overflow = false;
+    this.decoder = new TextDecoder('utf-8', { fatal: false });
+  }
+  /** @param {Uint8Array} bytes  @returns {{text:string, overflow:boolean}[]} */
+  push(bytes) {
+    const out = [];
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i];
+      if (b === 0x0a || b === 0x0d) {
+        if (this.n > 0 || this.overflow) out.push(this._take());
+        continue;
+      }
+      if (this.n < this.maxLen) this.buf[this.n++] = b;
+      else this.overflow = true;
+    }
+    return out;
+  }
+  /** Emit any unterminated remainder (end of stream). */
+  flush() {
+    return (this.n > 0 || this.overflow) ? [this._take()] : [];
+  }
+  reset() { this.n = 0; this.overflow = false; }
+  _take() {
+    const line = { text: this.decoder.decode(this.buf.subarray(0, this.n)), overflow: this.overflow };
+    this.n = 0;
+    this.overflow = false;
+    return line;
+  }
+}
+
+/**
+ * Dropped-frame accounting over a wrapping uint16 seq.
+ * update() returns { event, dropped } where event is one of
+ *   'none'      seq unavailable (e.g. MQTT)
+ *   'first'     first frame since reset(); baseline only
+ *   'reboot'    POWER_ON flag set; re-baseline, nothing counted as dropped
+ *   'ok'        forward step (dropped = step - 1, handles the 65535->0 wrap)
+ *   'duplicate' same seq again
+ *   'resync'    implausible jump (unflagged reset or rewind); re-baseline
+ * elapsedMs/intervalMs, when given, bound how many frames could plausibly
+ * have been lost: a reset from seq 63000 to 0 without the POWER_ON flag looks
+ * like a 2535-frame forward gap through the wrap, and only wall-clock time
+ * can tell it apart from a genuine 7-hour outage.
+ */
+class SeqTracker {
+  constructor() { this.reset(); }
+  reset() { this.last = null; }
+  update(seq, flags, elapsedMs, intervalMs) {
+    if (seq === null || seq === undefined) return { event: 'none', dropped: 0 };
+    if (flags !== null && flags !== undefined && (flags & FLAG.POWER_ON)) {
+      this.last = seq;
+      return { event: 'reboot', dropped: 0 };
+    }
+    if (this.last === null) { this.last = seq; return { event: 'first', dropped: 0 }; }
+    const step = ((seq - this.last) % SEQ_MOD + SEQ_MOD) % SEQ_MOD;
+    if (step === 0) return { event: 'duplicate', dropped: 0 };
+    let maxGap = MAX_PLAUSIBLE_GAP;
+    if (Number.isFinite(elapsedMs) && Number.isFinite(intervalMs) && intervalMs > 0) {
+      // 2x margin plus a constant absorbs jitter and a mis-set interval.
+      maxGap = Math.min(maxGap, Math.ceil(elapsedMs / intervalMs) * 2 + 2);
+    }
+    this.last = seq;
+    if (step - 1 > maxGap) return { event: 'resync', dropped: 0 };
+    return { event: 'ok', dropped: step - 1 };
+  }
+}
+
+function flagsHex(flags) {
+  return flags === null || flags === undefined ? '' : '0x' + flags.toString(16).toUpperCase().padStart(2, '0');
+}
+
+const CSV_HEADER = ['timestamp_iso', 'seq', 'co2_ppm', 't_in_c', 'rh_in_pct', 't_out_c', 'rh_out_pct', 'raw_counts', 'flags'];
+
+/** Records -> CSV text. Nulls are empty cells; flags kept as raw hex. */
+function recordsToCsv(records) {
+  const cell = v => (v === null || v === undefined) ? '' : String(v);
+  const lines = [CSV_HEADER.join(',')];
+  for (const r of records) {
+    lines.push([
+      new Date(r.ts).toISOString(), cell(r.seq), cell(r.co2), cell(r.tIn), cell(r.rhIn),
+      cell(r.tOut), cell(r.rhOut), cell(r.rawCounts), flagsHex(r.flags),
+    ].join(','));
+  }
+  return lines.join('\r\n') + '\r\n';
+}
+
+/** First index with records[i].ts >= ts (records sorted by ts). */
+function lowerBoundTs(records, ts) {
+  let lo = 0, hi = records.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (records[mid].ts < ts) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+/**
+ * Columnar chart data [x(s), co2, tIn, tOut, rhIn, rhOut, rawCounts] for records with
+ * ts >= fromTs. Where consecutive records are more than gapMs apart (link
+ * down, port closed) an all-null row is inserted so the line breaks instead
+ * of drawing a straight segment across time we have no data for.
+ */
+function buildSeries(records, fromTs, gapMs) {
+  const cols = [[], [], [], [], [], [], []];
+  let prevTs = null;
+  for (let i = lowerBoundTs(records, fromTs); i < records.length; i++) {
+    const r = records[i];
+    if (prevTs !== null && r.ts - prevTs > gapMs) {
+      cols[0].push((prevTs + (r.ts - prevTs) / 2) / 1000);
+      for (let c = 1; c < 7; c++) cols[c].push(null);
+    }
+    cols[0].push(r.ts / 1000);
+    cols[1].push(r.co2); cols[2].push(r.tIn); cols[3].push(r.tOut); cols[4].push(r.rhIn); cols[5].push(r.rhOut);
+    cols[6].push(r.rawCounts);
+    prevTs = r.ts;
+  }
+  return cols;
+}
+
+// §11.6 topic suffix -> record field. weight_kg is derived downstream and ignored.
+const MQTT_TOPIC_FIELDS = {
+  co2: 'co2', temp_internal: 'tIn', rh_internal: 'rhIn',
+  temp_ambient: 'tOut', rh_ambient: 'rhOut', weight_raw: 'rawCounts', flags: 'flags',
+};
+
+/** One MQTT payload -> number, null (NaN/inf), or undefined (malformed). */
+function parseMqttValue(field, text) {
+  if (field === 'flags') {
+    const v = /^0x/i.test(text) ? parseInt(text, 16) : parseInt(text, 10);
+    return Number.isFinite(v) ? v : undefined;
+  }
+  if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text);
+  return /^(nan|-?inf)$/i.test(text) ? null : undefined;
+}
+
+/**
+ * Rebuild records from mqtt-logger lines "<ISO time> <topic> <payload>"
+ * (tools/log-mqtt.sh). Assembly mirrors MqttSource: a burst closes when a field
+ * repeats or more than assemblyMs passes between lines. The record's ts is its
+ * first line's log time (1 s resolution, receive time at the logger). Lines
+ * for other topics (status, rssi, other prefixes) are ignored; unparseable
+ * lines and bad payloads are counted in `skipped`, e.g. a line cut short by a crash.
+ */
+function parseLogToRecords(text, prefix, assemblyMs) {
+  const root = prefix.replace(/\/+$/, '') + '/';
+  const records = [];
+  let pending = null, lastTs = 0, skipped = 0;
+  const flush = () => {
+    if (pending) records.push({ ts: pending.ts, seq: null, ...normaliseValues(pending.raw) });
+    pending = null;
+  };
+  const lines = text.split('\n');
+  // The logger ends every line with \n, so a last line without one was cut short
+  // (power loss, or we fetched mid-write). "co2 31" would parse as 31 ppm, not 3100.0.
+  if (lines.pop() !== '') skipped++;
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const m = /^(\S+) (\S+) (.*)$/.exec(line);
+    // mosquitto_sub's %I is ISO-8601 with a colon-less offset (-0500); not every engine parses that.
+    const ts = m ? Date.parse(m[1].replace(/([+-]\d\d)(\d\d)$/, '$1:$2')) : NaN;
+    if (!m || Number.isNaN(ts)) { skipped++; continue; }
+    if (!m[2].startsWith(root)) continue;
+    const field = MQTT_TOPIC_FIELDS[m[2].slice(root.length)];
+    if (!field) continue;
+    const v = parseMqttValue(field, m[3].trim());
+    if (v === undefined) { skipped++; continue; }
+    if (pending && (field in pending.raw || ts - lastTs > assemblyMs)) flush();
+    if (!pending) pending = { ts, raw: {} };
+    pending.raw[field] = v;
+    lastTs = ts;
+  }
+  flush();
+  records.sort((a, b) => a.ts - b.ts);   // a stepped wall clock can leave the log out of order
+  return { records, skipped };
+}
+
+/**
+ * Add log records to `mem` (both sorted by ts), skipping any log record that has
+ * an in-memory record within tolMs: the same frame seen twice (live feed and
+ * log), whose timestamps differ by the log's 1 s truncation plus transit.
+ * Returns `mem` itself when nothing is added.
+ */
+function mergeLogRecords(mem, logRecs, tolMs) {
+  const extra = [];
+  for (const r of logRecs) {
+    const i = lowerBoundTs(mem, r.ts - tolMs);
+    if (i < mem.length && mem[i].ts <= r.ts + tolMs) continue;
+    extra.push(r);
+  }
+  return extra.length ? mem.concat(extra).sort((a, b) => a.ts - b.ts) : mem;
+}
+
+// ---- Public feed: Firebase RTDB (public-feed/CONTRACT.md is canonical) ----
+// Values in RTDB are already normalised by the publisher, so they are only
+// type-checked here, never re-run through normaliseValues(): a 5-min rollup's
+// flags are the OR of the bucket, and nulling its means on that OR would throw
+// away a bucket's worth of good readings for one failed frame.
+const HIST_BUCKET_MS = 300000;
+
+/** RTDB value -> finite number or null. RTDB drops null-valued keys, so absent = null. */
+function rtdbNum(v) { return typeof v === 'number' && Number.isFinite(v) ? v : null; }
+
+function rtdbToRecord(ts, v) {
+  return {
+    ts, seq: null,   // the feed carries no seq, as with MQTT
+    co2: rtdbNum(v.co2), tIn: rtdbNum(v.tIn), rhIn: rtdbNum(v.rhIn),
+    tOut: rtdbNum(v.tOut), rhOut: rtdbNum(v.rhOut), rawCounts: rtdbNum(v.rawCounts), flags: rtdbNum(v.flags),
+  };
+}
+
+/** startAt key for history from sinceMs: 10-digit epoch seconds, so lexicographic = chronological. */
+function histStartKey(sinceMs) { return String(Math.floor(sinceMs / 1000)).padStart(10, '0'); }
+
+/**
+ * Body of GET <base>/hist.json -> {records (sorted by ts), skipped}. Drops the
+ * in-progress bucket (start > nowMs - 300 s): the publisher rewrites it on every
+ * frame and the live feed already covers that span. A bucket without a numeric
+ * ts falls back to its 10-digit key; with neither it is counted in skipped.
+ */
+function histToRecords(json, nowMs) {
+  const records = [];
+  let skipped = 0;
+  if (json === null || typeof json !== 'object') return { records, skipped };
+  for (const [key, v] of Object.entries(json)) {
+    if (v === null || typeof v !== 'object') { skipped++; continue; }
+    const ts = rtdbNum(v.ts) ?? (/^\d{10}$/.test(key) ? Number(key) * 1000 : null);
+    if (ts === null) { skipped++; continue; }
+    if (ts > nowMs - HIST_BUCKET_MS) continue;
+    records.push(rtdbToRecord(ts, v));
+  }
+  records.sort((a, b) => a.ts - b.ts);
+  return { records, skipped };
+}
+
+/** Immutable set of `value` at path `parts` under `obj`; null deletes, as RTDB does. */
+function rtdbSetAt(obj, parts, value) {
+  if (!parts.length) return value === undefined ? null : value;
+  const base = (obj !== null && typeof obj === 'object') ? obj : {};
+  const [head, ...rest] = parts;
+  const out = { ...base };
+  const v = rtdbSetAt(base[head], rest, value);
+  if (v === null) delete out[head]; else out[head] = v;
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * Apply one RTDB streaming event to the current value of the watched location
+ * and return the new value (input not mutated). `payload` is the event's parsed
+ * {path, data}. put: path "/" replaces the whole value, otherwise one child.
+ * patch: each key of data is merged under path. Other event types are no-ops.
+ */
+function applyRtdbEvent(cur, type, payload) {
+  if (!payload || typeof payload.path !== 'string') return cur;
+  const parts = payload.path.split('/').filter(Boolean);
+  if (type === 'put') return rtdbSetAt(cur, parts, payload.data);
+  if (type === 'patch' && payload.data && typeof payload.data === 'object') {
+    let out = cur;
+    for (const [k, v] of Object.entries(payload.data)) out = rtdbSetAt(out, parts.concat(k.split('/').filter(Boolean)), v);
+    return out;
+  }
+  return cur;
+}
+
+/** Current /live value -> record, or null when there is no usable ts yet. */
+function liveToRecord(live) {
+  if (live === null || typeof live !== 'object') return null;
+  const ts = rtdbNum(live.ts);
+  return ts === null ? null : rtdbToRecord(ts, live);
+}
+
+/** Current /live value -> gateway meta {rssi, gatewayStatus}, nulls when absent. */
+function liveMeta(live) {
+  const o = (live !== null && typeof live === 'object') ? live : {};
+  return { rssi: rtdbNum(o.rssi), gatewayStatus: typeof o.gatewayStatus === 'string' ? o.gatewayStatus : null };
+}
+
+const HIVE_CORE_EXPORTS = {
+  FLAG, SEQ_MOD, MAX_PLAUSIBLE_GAP, xorChecksum, normaliseValues, parseHiveLine,
+  LineSplitter, SeqTracker, flagsHex, recordsToCsv, CSV_HEADER, lowerBoundTs, buildSeries,
+  MQTT_TOPIC_FIELDS, parseMqttValue, parseLogToRecords, mergeLogRecords,
+  HIST_BUCKET_MS, histStartKey, histToRecords, applyRtdbEvent, liveToRecord, liveMeta,
+};
+// ==== END HIVE-CORE ====
+
+
+// ============================================================================
+// Sources
+//
+// Interface (every source is an EventTarget):
+//   connect(): Promise          open / subscribe; may prompt the user
+//   disconnect(): Promise       clean shutdown; safe to call twice
+//   send(text): Promise         send a command line; rejects if !canSend
+//   canSend: boolean            whether send() is meaningful
+//   label: string
+// Events (CustomEvent, payload in .detail):
+//   'record'      normalised {ts, seq, co2, tIn, rhIn, tOut, rhOut, rawCounts, flags}
+//   'frame-error' {kind: 'bad-checksum'|'malformed', reason, text}
+//   'line'        {text, dir: 'rx'|'tx'|'info'|'err'|'frame'} for the raw console
+//   'state'       {state: 'connecting'|'booting'|'live'|'disconnected'|'error', text}
+//   'meta'        {key: 'rssi'|'gatewayStatus'|'liveTs', value}
+//   'history'     {records, skipped}  bulk history to merge (FirebaseSource only)
+// ============================================================================
+
+class BaseSource extends EventTarget {
+  emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
+  state(state, text) { this.state_ = state; this.emit('state', { state, text }); }
+  info(text, dir = 'info') { this.emit('line', { text, dir }); }
+}
+
+const STREAM_ON_CMD = 'p 1';
+const BOOT_FALLBACK_MS = 5000;   // SCD-30 init retries up to 2 s; boot is 2-4 s
+const ACK_TIMEOUT_MS = 3000;     // wait for "# stream ON" before one retry
+
+/**
+ * Shared behaviour for sources that carry the raw ASCII protocol (serial and
+ * the simulator): byte splitting, frame parsing and the boot handshake.
+ */
+class LineProtocolSource extends BaseSource {
+  constructor() {
+    super();
+    this.splitter = new LineSplitter(512);
+    this._bootTimer = null;
+    this._ackTimer = null;
+    this._handshakeDone = false;
+    this._acked = false;
+  }
+
+  handleBytes(bytes, tsOverride) {
+    for (const line of this.splitter.push(bytes)) this.handleLine(line.text, tsOverride, line.overflow);
+  }
+
+  handleLine(text, tsOverride, overflow = false) {
+    const ts = tsOverride ?? Date.now();
+    if (overflow) { this.info(`line exceeded 512 bytes, discarded: ${text.slice(0, 80)}…`, 'err'); return; }
+    const res = parseHiveLine(text);
+    if (res.kind === 'frame') {
+      this.emit('line', { text, dir: 'frame' });
+      if (this.state_ === 'booting') this.state('live', 'Streaming');
+      this.emit('record', { ts, ...res.frame });
+      return;
+    }
+    if (res.kind === 'bad-checksum' || res.kind === 'malformed') {
+      this.emit('frame-error', { kind: res.kind, reason: res.reason, text });
+      this.info(`✗ ${res.kind}: ${res.reason} | ${text}`, 'err');
+      return;
+    }
+    this.emit('line', { text, dir: 'rx' });
+    // Strip leading non-printables: the first line after a reset often
+    // carries bootloader noise.
+    const clean = text.replace(/^[^\x20-\x7e]+/, '').trimStart();
+    if (/^#\s*stream ON/i.test(clean)) { this._acked = true; clearTimeout(this._ackTimer); return; }
+    if (/^Ready\./.test(clean)) {
+      if (!this._handshakeDone) { this._streamOn('saw "Ready."'); return; }
+      // A later "Ready." is an unexpected reboot (watchdog, brown-out). The
+      // firmware boots with streaming OFF, but we deliberately do NOT resend
+      // "p 1": while an FRC is pending, ANY line other than "y" cancels it,
+      // so the only automatic command is the one sent right after connect.
+      this.state('booting', 'Node rebooted: streaming is off. Send "p 1" to resume.');
+      this.info('node rebooted ("Ready." seen mid-session). Streaming is OFF after boot; send "p 1" to resume (not sent automatically, see FRC rule).', 'err');
+    }
+  }
+
+  /** Call right after the link opens: the Uno resets, so wait for Ready. */
+  beginBootWait() {
+    this.splitter.reset();
+    this._handshakeDone = false;   // "p 1" is sent at most once per connect (+1 retry)
+    this._acked = false;
+    this.state('booting', 'Waiting for boot (Ready.)…');
+    clearTimeout(this._bootTimer);
+    this._bootTimer = setTimeout(() => this._streamOn(`no "Ready." within ${BOOT_FALLBACK_MS / 1000} s, sending anyway`), BOOT_FALLBACK_MS);
+  }
+
+  _streamOn(why) {
+    clearTimeout(this._bootTimer);
+    this._bootTimer = null;
+    if (this._handshakeDone) return;
+    this._handshakeDone = true;
+    // Always "p 1", never bare "p": bare "p" toggles.
+    const sendIt = (note) => {
+      this.info(`enabling streaming (${note})`);
+      this.send(STREAM_ON_CMD).catch(err => this.info(`failed to send "${STREAM_ON_CMD}": ${err.message}`, 'err'));
+    };
+    sendIt(why);
+    if (this.state_ === 'booting') this.state('booting', 'Streaming requested, waiting for first frame…');
+    // Ack is "# stream ON <n> s". Retry exactly once if it hasn't arrived.
+    clearTimeout(this._ackTimer);
+    this._ackTimer = setTimeout(() => {
+      if (this._acked) return;
+      sendIt(`no "# stream ON" ack within ${ACK_TIMEOUT_MS / 1000} s, retrying once`);
+      this._ackTimer = setTimeout(() => {
+        if (!this._acked) this.info('still no "# stream ON" ack; send "p 1" manually', 'err');
+      }, ACK_TIMEOUT_MS);
+    }, ACK_TIMEOUT_MS);
+  }
+
+  /** The operator is typing commands: cancel any pending automatic send so
+   *  it can't land between "f <ppm>" and "y" and cancel the FRC. */
+  cancelAutoCommands() {
+    if (this._bootTimer || this._ackTimer) this.info('manual command: automatic "p 1" (re)send cancelled');
+    this.stopBootWait();
+    this._handshakeDone = true;
+  }
+
+  stopBootWait() {
+    clearTimeout(this._bootTimer); this._bootTimer = null;
+    clearTimeout(this._ackTimer); this._ackTimer = null;
+  }
+}
+
+/**
+ * USB serial via the Web Serial API (Chrome/Edge, secure context).
+ * Lifecycle: connect() -> open -> read loop -> (cable pull | disconnect()) ->
+ * cleanup -> 'disconnected'. If the device vanishes, we re-open it
+ * automatically when Chrome reports the same device re-plugged.
+ */
+class SerialSource extends LineProtocolSource {
+  constructor() {
+    super();
+    this.label = 'USB serial';
+    this.canSend = true;
+    this.port = null;
+    this.reader = null;
+    this._loop = null;
+    this._wantOpen = false;      // user intent; false after an explicit disconnect
+    this._writeChain = Promise.resolve();
+    this._encoder = new TextEncoder();
+    this._onConnectEvt = (e) => this._maybeAutoReconnect(e.target);
+    this._onDisconnectEvt = (e) => { if (e.target === this.port) this.info('USB device removed', 'err'); };
+    if ('serial' in navigator) {
+      navigator.serial.addEventListener('connect', this._onConnectEvt);
+      navigator.serial.addEventListener('disconnect', this._onDisconnectEvt);
+    }
+  }
+
+  static supported() { return 'serial' in navigator; }
+
+  async connect() {
+    if (!SerialSource.supported()) throw new Error('Web Serial is not available. Use Chrome or Edge, from http://localhost or file://.');
+    if (this._loop) return;   // already open
+    let port = this.port;
+    if (!port) {
+      // requestPort() needs a user gesture; connect() is only called from a click.
+      // No USB filter: genuine Unos (0x2341) and CH340 clones (0x1a86) both occur.
+      port = await navigator.serial.requestPort();
+    }
+    await this._open(port);
+  }
+
+  async _open(port) {
+    this.state('connecting', 'Opening port…');
+    try {
+      await port.open({ baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', flowControl: 'none', bufferSize: 4096 });
+    } catch (err) {
+      // InvalidStateError = already open in this tab; NetworkError = another
+      // program (Arduino IDE Serial Monitor) holds it, or the device is gone.
+      this.state('error', `Open failed: ${err.message}`);
+      if (err.name === 'NetworkError') this.info('Port busy or gone. Close the Arduino IDE Serial Monitor (only one program can hold the port) and retry.', 'err');
+      throw err;
+    }
+    this.port = port;
+    this._wantOpen = true;
+    const info = port.getInfo ? port.getInfo() : {};
+    this.info(`port open, 9600 8N1${info.usbVendorId ? ` (USB ${info.usbVendorId.toString(16)}:${(info.usbProductId || 0).toString(16)})` : ''}`);
+    // Opening asserts DTR, which resets the Uno through its auto-reset cap.
+    this.beginBootWait();
+    this._loop = this._readLoop().finally(() => { this._loop = null; });
+  }
+
+  async _readLoop() {
+    // Per the Web Serial spec, non-fatal errors (framing, parity, buffer
+    // overrun, break) leave port.readable replaced by a fresh stream, so the
+    // outer loop re-acquires a reader. A fatal error (device lost) leaves
+    // readable null and the loop ends.
+    let lost = null;
+    while (this.port && this.port.readable && this._wantOpen) {
+      this.reader = this.port.readable.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await this.reader.read();
+          if (done) break;               // reader.cancel() from disconnect()
+          if (value && value.length) this.handleBytes(value);
+        }
+      } catch (err) {
+        if (err.name === 'NetworkError' || !this.port.readable) { lost = err; }
+        else this.info(`serial read error (${err.name}): ${err.message}; continuing`, 'err');
+      } finally {
+        try { this.reader.releaseLock(); } catch (_) { /* already released */ }
+        this.reader = null;
+      }
+      if (lost) break;
+    }
+    this.stopBootWait();
+    for (const line of this.splitter.flush()) this.handleLine(line.text, undefined, line.overflow);
+    // Always try to close so the OS handle is released (needed to reopen).
+    try { await this.port.close(); } catch (_) { /* port already invalid after unplug */ }
+    if (this._wantOpen) {
+      this.state('disconnected', `Link lost${lost ? `: ${lost.message}` : ''}. Re-plug to resume, or Reconnect.`);
+    } else {
+      this.state('disconnected', 'Disconnected');
+    }
+  }
+
+  async _maybeAutoReconnect(port) {
+    // Chrome may hand back a new SerialPort object for the re-plugged device,
+    // so accept any previously-granted port when we were holding one before.
+    if (!this._wantOpen || this._loop) return;
+    this.info('USB device re-plugged, reopening…');
+    try { await this._open(port); } catch (_) { /* reported in _open */ }
+  }
+
+  async disconnect() {
+    this._wantOpen = false;
+    this.stopBootWait();
+    if (this.reader) { try { await this.reader.cancel(); } catch (_) {} }
+    if (this._loop) await this._loop;
+    // Keep this.port so Reconnect can reopen without a chooser prompt.
+  }
+
+  /** Reconnect: reuse the port object, else any previously granted port, else prompt. */
+  async reconnect() {
+    if (this._loop) return;
+    let port = this.port;
+    if (!port) {
+      const granted = await navigator.serial.getPorts();
+      if (granted.length === 1) port = granted[0];
+    }
+    if (!port) port = await navigator.serial.requestPort();
+    try { await this._open(port); }
+    catch (err) {
+      // The cached object may be stale after an unplug; fall back to the chooser.
+      if (port === this.port) { this.port = null; await this._open(await navigator.serial.requestPort()); }
+      else throw err;
+    }
+  }
+
+  send(text) {
+    // Writes are serialised: concurrent getWriter() calls would throw.
+    const job = this._writeChain.then(async () => {
+      if (!this.port || !this.port.writable) throw new Error('port not open');
+      const w = this.port.writable.getWriter();
+      try { await w.write(this._encoder.encode(text + '\n')); }
+      finally { w.releaseLock(); }
+      this.info(`> ${text}`, 'tx');
+    });
+    this._writeChain = job.catch(() => {});
+    return job;
+  }
+}
+
+/**
+ * MQTT over WebSockets via MQTT.js.
+ *
+ * *** UNTESTED: no broker or gateway exists yet. ***
+ *
+ * Subscribes to <prefix>/# and assembles one record per publish burst of the
+ * §11.6 per-measurand topics. The gateway publishes those topics back to back
+ * per frame; a record is emitted when (a) a topic repeats before the burst
+ * closed, meaning the next frame started, or (b) ASSEMBLY_MS passes with no
+ * new measurand. MQTT carries no seq, so seq is null and drop counting is off.
+ * Retained measurand topics, if the gateway retains them, will produce one
+ * stale record on subscribe; its ts is the arrival time, not the frame time.
+ */
+const MQTT_JS_URL = 'https://cdn.jsdelivr.net/npm/mqtt@5.16.1/dist/mqtt.min.js';
+const MQTT_JS_SRI = 'sha384-ilRYg/zm2XqUafLvBoGVk40UfNRnvUkYMy+e/JPo4YgsFR6X9Q3jYEkqFQXquX4r';
+let mqttLibPromise = null;
+function loadMqttLib() {
+  if (window.mqtt) return Promise.resolve(window.mqtt);
+  if (!mqttLibPromise) {
+    mqttLibPromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = MQTT_JS_URL; s.integrity = MQTT_JS_SRI; s.crossOrigin = 'anonymous';
+      s.onload = () => window.mqtt ? resolve(window.mqtt) : reject(new Error('MQTT.js loaded but no global'));
+      s.onerror = () => { mqttLibPromise = null; reject(new Error('could not load MQTT.js from CDN')); };
+      document.head.appendChild(s);
+    });
+  }
+  return mqttLibPromise;
+}
+
+class MqttSource extends BaseSource {
+  static ASSEMBLY_MS = 2000;
+  static TOPICS = MQTT_TOPIC_FIELDS;
+
+  constructor({ url, prefix, username, password }) {
+    super();
+    this.label = 'MQTT';
+    this.canSend = false;   // the gateway has no command topic defined in §11.6
+    this.url = url;
+    this.prefix = prefix.replace(/\/+$/, '');
+    this.username = username || undefined;
+    this.password = password || undefined;
+    this.client = null;
+    this.pending = null;
+    this.timer = null;
+  }
+
+  async connect() {
+    if (!/^wss?:\/\//.test(this.url)) throw new Error('Broker URL must start with ws:// or wss:// (MQTT over WebSocket)');
+    this.state('connecting', `Loading MQTT.js…`);
+    const mqtt = await loadMqttLib();
+    this.state('connecting', `Connecting to ${this.url}…`);
+    const client = mqtt.connect(this.url, {
+      clientId: 'hive-dash-' + Math.random().toString(16).slice(2, 10),
+      clean: true, reconnectPeriod: 5000, connectTimeout: 10000, keepalive: 30,
+      username: this.username, password: this.password,
+    });
+    this.client = client;
+    const topic = `${this.prefix}/#`;
+    client.on('connect', () => {
+      this.state('live', `Connected to ${this.url}`);
+      client.subscribe(topic, { qos: 0 }, (err) => {
+        if (err) this.info(`subscribe ${topic} failed: ${err.message}`, 'err');
+        else this.info(`subscribed ${topic}`);
+      });
+    });
+    client.on('reconnect', () => this.state('connecting', `Reconnecting to ${this.url}…`));
+    client.on('offline', () => this.state('disconnected', 'Broker offline, retrying'));
+    client.on('error', (err) => { this.info(`MQTT error: ${err.message}`, 'err'); this.state('error', err.message); });
+    client.on('close', () => { if (this.client === client && this.state_ !== 'disconnected') this.state('connecting', 'Connection closed, retrying'); });
+    client.on('message', (t, payload) => this._onMessage(t, payload));
+  }
+
+  _onMessage(topic, payload) {
+    const text = new TextDecoder().decode(payload).trim();
+    if (!topic.startsWith(this.prefix + '/')) return;
+    const sub = topic.slice(this.prefix.length + 1);
+    this.emit('line', { text: `${topic} ${text}`, dir: 'rx' });
+    if (sub === 'status') { this.emit('meta', { key: 'gatewayStatus', value: text }); return; }
+    if (sub === 'rssi')   { const v = Number(text); this.emit('meta', { key: 'rssi', value: Number.isFinite(v) ? v : null }); return; }
+    const field = MqttSource.TOPICS[sub];
+    if (!field) return;
+    const v = parseMqttValue(field, text);
+    if (v === undefined) {
+      this.emit('frame-error', { kind: 'malformed', reason: `bad payload on ${sub}`, text: `${topic} ${text}` });
+      return;
+    }
+    if (this.pending && field in this.pending.raw) this._flush();   // topic repeat = next frame
+    if (!this.pending) this.pending = { ts: Date.now(), raw: {} };
+    this.pending.raw[field] = v;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this._flush(), MqttSource.ASSEMBLY_MS);
+  }
+
+  _flush() {
+    clearTimeout(this.timer); this.timer = null;
+    if (!this.pending) return;
+    const { ts, raw } = this.pending;
+    this.pending = null;
+    this.emit('record', { ts, seq: null, ...normaliseValues(raw) });
+  }
+
+  send() { return Promise.reject(new Error('MQTT source is receive-only')); }
+
+  async disconnect() {
+    this._flush();
+    const c = this.client; this.client = null;
+    if (c) await new Promise(res => c.end(false, {}, res));
+    this.state('disconnected', 'Disconnected');
+  }
+}
+
+/**
+ * Read-only public feed from Firebase RTDB (public-feed/CONTRACT.md), used only
+ * in public mode (<meta name="hive-firebase">). History: one GET of the 5-min
+ * rollups under <base>/hist, emitted as a 'history' event for the app to merge.
+ * Live: the RTDB REST streaming API on <base>/live via EventSource. Firebase
+ * re-sends the current value on every (re)connect, so records are deduped by ts.
+ */
+class FirebaseSource extends BaseSource {
+  static HIST_DAYS = 7;
+  static HIST_REFETCH_MS = 60000;   // a flapping stream must not re-download a week of rollups
+  static RETRY_MS = 30000;          // after a refused stream (EventSource gives up on non-200)
+
+  constructor(base) {
+    super();
+    this.label = 'Public feed';
+    this.canSend = false;
+    this.base = base.replace(/\/+$/, '');
+    this.es = null;
+    this.live = null;        // current /live value, maintained from put/patch events
+    this.lastTs = null;      // ts of the last record emitted
+    this.histAt = 0;
+    this.retryTimer = null;
+    this.closed = false;
+  }
+
+  async connect() {
+    if (!/^https:\/\//.test(this.base)) throw new Error('hive-firebase base URL must start with https://');
+    this.closed = false;
+    this.state('connecting', 'Connecting to the public feed…');
+    this._open();
+    this.fetchHistory();   // not awaited: live and history arrive independently
+  }
+
+  _open() {
+    clearTimeout(this.retryTimer); this.retryTimer = null;
+    if (this.closed) return;
+    const es = new EventSource(this.base + '/live.json');
+    this.es = es;
+    es.addEventListener('open', () => {
+      if (this.es !== es) return;
+      this.state('live', 'Live');
+      // A reconnect after an outage: fetch the rollups that cover the gap.
+      if (Date.now() - this.histAt > FirebaseSource.HIST_REFETCH_MS) this.fetchHistory();
+    });
+    for (const type of ['put', 'patch']) es.addEventListener(type, (e) => this._onEvent(es, type, e.data));
+    es.addEventListener('cancel', () => this._fail(es, 'Feed cancelled by the server (read not permitted?)'));
+    es.addEventListener('auth_revoked', () => this._fail(es, 'Feed authorisation revoked'));
+    es.addEventListener('error', () => {
+      if (this.es !== es) return;
+      // CLOSED = the server answered non-200 (e.g. 401 before the rules are
+      // published) and EventSource will not retry by itself. CONNECTING = it will.
+      if (es.readyState === EventSource.CLOSED) this._fail(es, 'Connection refused');
+      else this.state('connecting', 'Connection lost, retrying…');
+    });
+  }
+
+  _fail(es, text) {
+    if (this.es !== es) return;
+    es.close(); this.es = null;
+    this.state('error', `${text}; retrying in ${FirebaseSource.RETRY_MS / 1000} s`);
+    if (!this.closed) this.retryTimer = setTimeout(() => this._open(), FirebaseSource.RETRY_MS);
+  }
+
+  _onEvent(es, type, text) {
+    if (this.es !== es) return;
+    let payload;
+    try { payload = JSON.parse(text); } catch {
+      this.emit('frame-error', { kind: 'malformed', reason: `unparseable ${type} event`, text: String(text) });
+      return;
+    }
+    this.emit('line', { text: `${type} ${text}`, dir: 'frame' });
+    this.live = applyRtdbEvent(this.live, type, payload);
+    const meta = liveMeta(this.live);
+    this.emit('meta', { key: 'rssi', value: meta.rssi });
+    this.emit('meta', { key: 'gatewayStatus', value: meta.gatewayStatus });
+    const rec = liveToRecord(this.live);
+    if (!rec) return;
+    this.emit('meta', { key: 'liveTs', value: rec.ts });
+    if (this.lastTs !== null && rec.ts <= this.lastTs) return;   // re-sent on reconnect, or a non-ts child update
+    this.lastTs = rec.ts;
+    this.emit('record', rec);
+  }
+
+  async fetchHistory() {
+    this.histAt = Date.now();
+    const start = histStartKey(Date.now() - FirebaseSource.HIST_DAYS * 86400000);
+    const url = `${this.base}/hist.json?orderBy=${encodeURIComponent('"$key"')}&startAt=${encodeURIComponent(`"${start}"`)}`;
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`hist answered HTTP ${res.status}`);
+      const { records, skipped } = histToRecords(await res.json(), Date.now());
+      if (!this.closed) this.emit('history', { records, skipped });
+    } catch (err) {
+      this.info(`history unavailable: ${err.message}`, 'err');
+    }
+  }
+
+  send() { return Promise.reject(new Error('the public feed is receive-only')); }
+
+  async disconnect() {
+    this.closed = true;
+    clearTimeout(this.retryTimer); this.retryTimer = null;
+    if (this.es) { this.es.close(); this.es = null; }
+    this.state('disconnected', 'Disconnected');
+  }
+}
+
+
+/**
+ * Simulated hive node for ?demo=1. Emits raw bytes through the same
+ * LineProtocolSource path as SerialSource, in random small chunks, so the
+ * demo exercises the splitter, parser and boot handshake, not just the UI.
+ * Scripted events per live frame k: seq starts at 65530 (wraps at k=6),
+ * one dropped seq, a bad checksum every 13 frames, junk bytes before a frame,
+ * DHT22 and SCD-30 failures (sentinels + flags), and a reboot every 60 frames.
+ */
+class SimSource extends LineProtocolSource {
+  constructor(intervalMs = 1000) {
+    super();
+    this.label = 'Simulated';
+    this.canSend = true;
+    this.intervalMs = intervalMs;
+    this.enc = new TextEncoder();
+    this.timers = new Set();
+    this.streaming = false;
+    this.k = 0;
+    this.seq = 65530;
+    this.powerOn = true;
+    this.co2 = 2600;
+    this.frcPending = false;
+  }
+
+  _later(fn, ms) { const t = setTimeout(() => { this.timers.delete(t); fn(); }, ms); this.timers.add(t); }
+
+  _write(text) {
+    // Random 1-9 byte chunks: proves lines and CRLF pairs may straddle reads.
+    const bytes = this.enc.encode(text);
+    for (let i = 0; i < bytes.length;) {
+      const n = 1 + Math.floor(Math.random() * 9);
+      this.handleBytes(bytes.subarray(i, i + n));
+      i += n;
+    }
+  }
+
+  _frameLine(seq, v, flags) {
+    const fmt = (x, dp) => (x === -1 || x === -999) ? String(x) : x.toFixed(dp);
+    const body = `HIVE,${seq},${fmt(v.co2, 1)},${fmt(v.tIn, 2)},${fmt(v.rhIn, 1)},${fmt(v.tOut, 2)},${fmt(v.rhOut, 1)},0,0x${flags.toString(16).toUpperCase().padStart(2, '0')}`;
+    return `$${body}*${xorChecksum(body).toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+
+  _values(tsMs) {
+    const hours = tsMs / 3.6e6;
+    this.co2 = Math.min(4200, Math.max(900, this.co2 + (Math.random() - 0.5) * 40 + (2600 - this.co2) * 0.01));
+    return {
+      co2: this.co2,
+      tIn: 34.6 + 0.3 * Math.sin(hours * 2 * Math.PI / 0.9) + (Math.random() - 0.5) * 0.06,
+      rhIn: 61 + 2.5 * Math.sin(hours * 2 * Math.PI / 1.3) + (Math.random() - 0.5) * 0.4,
+      tOut: 17.5 + 2.5 * Math.sin(hours * 2 * Math.PI / 2) + (Math.random() - 0.5) * 0.1,
+      rhOut: 72 - 6 * Math.sin(hours * 2 * Math.PI / 2) + (Math.random() - 0.5) * 0.8,
+    };
+  }
+
+  async connect() {
+    this.state('connecting', 'Starting simulator…');
+    // Backfill one hour of history at the live interval so charts have shape
+    // immediately. Includes a reboot and a DHT22 outage. Goes through the
+    // parser with back-dated timestamps.
+    const now = Date.now();
+    const n = Math.floor(3600e3 / this.intervalMs);
+    let seq = 40000;
+    for (let i = 0; i < n; i++) {
+      const ts = now - (n - i) * this.intervalMs;
+      const v = this._values(ts);
+      let flags = FLAG.HX711_FAIL;
+      if (i === 0 || i === Math.floor(n * 0.4)) { flags |= FLAG.POWER_ON; seq = 0; }
+      if (i > n * 0.65 && i < n * 0.7) { flags |= FLAG.DHT22_FAIL; v.tOut = -999; v.rhOut = -999; }
+      this.handleLine(this._frameLine(seq, v, flags), ts);
+      seq = (seq + 1) % SEQ_MOD;
+    }
+    this._boot();
+  }
+
+  _boot() {
+    this.streaming = false;
+    this.beginBootWait();
+    this._bootBanner();
+  }
+
+  _bootBanner() {
+    // Bootloader noise, banner, a status table, then Ready after ~2.5 s.
+    this._write('\x00\xfe\r\n');
+    this._later(() => this._write('Hive node (simulated) fw sim-0.1\r\n# SCD-30 init... retry 1\r\n'), 300);
+    this._later(() => this._write('# SCD-30 OK, interval 2 s\r\n# DHT22 OK\r\n# HX711 not found (timeout)\r\n'), 1800);
+    this._later(() => this._write('Sensor     | Status\r\n-----------+-------\r\nSCD-30     | OK\r\nDHT22      | OK\r\nHX711      | ABSENT\r\n'), 2100);
+    this._later(() => this._write("Ready. Send 't' to run diagnostics, '?' for help.\r\n"), 2500);
+  }
+
+  _tick() {
+    if (!this.streaming) return;
+    const k = this.k++;
+    if (k > 0 && k % 60 === 30) {          // scripted reboot (e.g. watchdog)
+      this.streaming = false;
+      this.seq = 0;
+      this.powerOn = true;
+      this._write('\r\n');
+      // Real firmware boots with streaming OFF and the dashboard will not
+      // resend "p 1" (FRC rule). The sim deviates and resumes by itself after
+      // its banner so the demo keeps running; the dashboard still shows the
+      // "node rebooted" notice, which is the behaviour under test.
+      this._bootBanner();
+      this._later(() => { this.streaming = true; }, 2600);
+      return;
+    }
+    if (k === 5) this.seq = (this.seq + 1) % SEQ_MOD;   // drop exactly one frame
+    const v = this._values(Date.now());
+    let flags = FLAG.HX711_FAIL;
+    if (this.powerOn) { flags |= FLAG.POWER_ON; this.powerOn = false; }
+    if (k % 60 >= 15 && k % 60 < 20) { flags |= FLAG.DHT22_FAIL; v.tOut = -999; v.rhOut = -999; }
+    if (k % 60 === 24) { flags |= FLAG.SCD30_FAIL; v.co2 = -1; v.tIn = -999; v.rhIn = -999; }
+    let line = this._frameLine(this.seq, v, flags);
+    if (k % 13 === 7) line = line.replace(/,(\d)/, (m, d) => ',' + ((+d + 1) % 10));   // corrupt a digit
+    if (k % 60 === 10) line = '\xff\x13' + line;   // idle-line garbage before '$'
+    if (k % 5 === 0) this._write(`# status: free RAM ${780 + Math.floor(Math.random() * 40)} B\r\n`);
+    this._write(line + '\r\n');
+    this.seq = (this.seq + 1) % SEQ_MOD;
+  }
+
+  send(text) {
+    this.info(`> ${text}`, 'tx');
+    const reply = (s) => this._later(() => this._write(s + '\r\n'), 30);
+    const cmd = text.trim();
+    if (cmd === 'p 1') {
+      if (!this.streaming) {
+        this.streaming = true;
+        clearInterval(this.iv);
+        this.iv = setInterval(() => this._tick(), this.intervalMs);
+      }
+      reply(`# stream ON ${Math.round(this.intervalMs / 1000)} s`);
+    } else if (cmd === 'p 0') { this.streaming = false; reply('# streaming off'); }
+    else if (cmd === 't') reply('Diagnostics\r\n-----------\r\nSCD-30  OK  CO2 ' + this.co2.toFixed(1) + '\r\nDHT22   OK\r\nHX711   TIMEOUT');
+    else if (/^f\s+\d+$/.test(cmd)) { this.frcPending = true; reply(`# FRC to ${cmd.split(/\s+/)[1]} ppm requested. Send 'y' to confirm.`); }
+    else if (cmd === 'y') { reply(this.frcPending ? '# FRC applied' : '# nothing to confirm'); this.frcPending = false; }
+    else if (cmd === '?') reply('t diag | s readings | i i2c scan | f <ppm> FRC | p 0/1 stream | ? help');
+    else reply(`Unknown command '${cmd}'. Send '?' for help.`);
+    return Promise.resolve();
+  }
+
+  async disconnect() {
+    this.streaming = false;
+    clearInterval(this.iv);
+    for (const t of this.timers) clearTimeout(t);
+    this.timers.clear();
+    this.stopBootWait();
+    this.state('disconnected', 'Simulator stopped');
+  }
+}
+
+
+// ============================================================================
+// App. Everything below consumes source events only; it never branches on
+// which source is active (except for MQTT-only meta like RSSI, which simply
+// stays blank for other sources).
+// ============================================================================
+
+const HISTORY_CAP = 60480;   // 7 days at 10 s. ~60k rows x ~100 B = ~6 MB in memory.
+const STALE_FRAMES = 3;      // a tile goes stale after this many missed frames
+const params = new URLSearchParams(location.search);
+// Public mode (public-feed/CONTRACT.md): on only when tools/build-public.sh has
+// injected <meta name="hive-firebase" content="<RTDB URL>/hive01">. The local
+// dashboard has no such tag, so everything below behaves as before there.
+const FIREBASE_BASE = (document.querySelector('meta[name="hive-firebase"]')?.content || '').trim() || null;
+const PUBLIC = FIREBASE_BASE !== null;
+const PUBLIC_GAP_MS = 15 * 60000;     // hist points are 5 min apart; break the line only past 3 missing
+const PUBLIC_STALE_MS = 2 * 60000;    // contract: data older than 2 min is flagged stale
+const HIST_MERGE_TOL_MS = HIST_BUCKET_MS - 1;   // a rollup is skipped if memory already has data within its span
+const DEMO = !PUBLIC && params.get('demo') === '1';
+
+const $ = (id) => document.getElementById(id);
+
+const store = {
+  records: [],
+  reboots: [],        // ts (ms) of frames with POWER_ON
+  evicted: 0,         // records dropped by the history cap
+};
+const stats = {
+  framesOk: 0, checksumErr: 0, malformed: 0, dropped: 0, reboots: 0,
+  resyncs: 0, duplicates: 0, nonFrame: 0, lastFrameTs: null, gatewayStatus: null, rssi: null,
+  liveTs: null,       // public mode: ts of the current /live value (drives the data-age pill)
+};
+const tracker = new SeqTracker();
+let lastRecordTs = null;
+
+const MEASURANDS = [
+  { key: 'co2',   label: 'CO₂, in-hive',          unit: 'ppm', dp: 0, series: 1, sensor: 'SCD-30', bit: FLAG.SCD30_FAIL },
+  { key: 'tIn',   label: 'Temperature, in-hive',  unit: '°C',  dp: 2, series: 1, sensor: 'SCD-30', bit: FLAG.SCD30_FAIL },
+  { key: 'rhIn',  label: 'Humidity, in-hive',     unit: '%',   dp: 1, series: 1, sensor: 'SCD-30', bit: FLAG.SCD30_FAIL },
+  { key: 'tOut',  label: 'Temperature, ambient',  unit: '°C',  dp: 2, series: 2, sensor: 'DHT22',  bit: FLAG.DHT22_FAIL },
+  { key: 'rhOut', label: 'Humidity, ambient',     unit: '%',   dp: 1, series: 2, sensor: 'DHT22',  bit: FLAG.DHT22_FAIL },
+];
+const lastGood = {};      // key -> {v, ts}
+const lastWasNull = {};   // key -> bool (latest record had no value)
+
+const settings = {
+  intervalMs: DEMO ? 1000 : Number(localStorage.getItem('hive.intervalMs') || 10000),
+  // ?range=<seconds> overrides the saved chart range, e.g. ?range=900 for a bench test
+  rangeS: params.has('range') ? Number(params.get('range')) : Number(localStorage.getItem('hive.rangeS') ?? 3600),
+};
+
+let source = null;
+
+// ---------- formatting ----------
+const nf = {};
+// Display-only temperature unit. Records, frames, MQTT and the CSV export all
+// stay in °C (design.md §11.1, §11.6), so switching units never changes
+// captured data or makes exported files disagree with the raw frames.
+let tempUnit = localStorage.getItem('hive.tempUnit') === 'C' ? 'C' : 'F';
+const TEMP_KEYS = new Set(['tIn', 'tOut']);
+function tempDisp(c) { return (c === null || c === undefined || tempUnit === 'C') ? c : c * 9 / 5 + 32; }
+function tempLabel() { return tempUnit === 'F' ? '°F' : '°C'; }
+function unitOf(spec) { return spec.temp ? tempLabel() : spec.unit; }
+function emptyRange(spec) { return (spec.temp && tempUnit === 'F') ? [32, 104] : spec.empty; }
+
+function fmtNum(v, dp) {
+  if (v === null || v === undefined) return '—';
+  nf[dp] ||= new Intl.NumberFormat('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  return nf[dp].format(v);
+}
+function fmtAge(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ${s % 60} s`;
+  const h = Math.floor(m / 60);
+  return `${h} h ${m % 60} min`;
+}
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+// +0.5 frame of jitter slack. Public mode has no interval selector (the viewer
+// can't know the gateway's cadence), so it uses the contract's fixed 2 min.
+const staleAfterMs = () => PUBLIC ? PUBLIC_STALE_MS : (STALE_FRAMES + 0.5) * settings.intervalMs;
+
+// ---------- record ingest ----------
+function onRecord(rec) {
+  // Host receive time is the timestamp. Records are expected in order; if the
+  // wall clock steps backwards (NTP), clamp so the series stays sorted.
+  if (store.records.length && rec.ts < store.records[store.records.length - 1].ts) {
+    rec.ts = store.records[store.records.length - 1].ts;
+  }
+  const elapsed = lastRecordTs === null ? undefined : rec.ts - lastRecordTs;
+  const s = tracker.update(rec.seq, rec.flags, elapsed, settings.intervalMs);
+  stats.dropped += s.dropped;
+  if (s.event === 'resync') { stats.resyncs++; consoleAdd(`seq jumped to ${rec.seq} without the power-on flag; re-baselined`, 'info'); }
+  if (s.event === 'duplicate') stats.duplicates++;
+  if (rec.flags !== null && (rec.flags & FLAG.POWER_ON)) { stats.reboots++; store.reboots.push(rec.ts); }
+  lastRecordTs = rec.ts;
+  stats.framesOk++;
+  stats.lastFrameTs = rec.ts;
+
+  for (const m of MEASURANDS) {
+    const v = rec[m.key];
+    lastWasNull[m.key] = v === null;
+    if (v !== null) lastGood[m.key] = { v, ts: rec.ts };
+  }
+
+  store.records.push(rec);
+  // Evict in batches so a 60k-element splice happens rarely, not per frame.
+  if (store.records.length > HISTORY_CAP + 500) {
+    const n = store.records.length - HISTORY_CAP;
+    store.records.splice(0, n);
+    store.evicted += n;
+    const oldest = store.records[0].ts;
+    while (store.reboots.length && store.reboots[0] < oldest) store.reboots.shift();
+  }
+  scheduleRender();
+}
+
+// ---------- history backfill from the mqtt-logger files ----------
+// tools/log-mqtt.sh writes data/beehive-YYYY-MM-DD.log; dashboard/logs is a
+// symlink to it so the static server can hand the files to the page. Memory
+// alone loses everything on a reload, so the page rebuilds from disk on load and
+// again on each MQTT (re)connect to fill whatever the drop missed.
+const BACKFILL_MIN_GAP_MS = 30000;   // a flapping broker must not re-download days of logs
+let backfillBusy = false, backfillDoneAt = 0;
+let historyFloorTs = 0;              // "Clear history" hides log records older than this
+
+/** Swap in a merged record list and rebuild the state derived from records. */
+function adoptRecords(recs) {
+  const over = recs.length - HISTORY_CAP;
+  if (over > 0) { recs = recs.slice(over); store.evicted += over; }
+  store.records = recs;
+  store.reboots = recs.filter(r => r.flags !== null && (r.flags & FLAG.POWER_ON)).map(r => r.ts);
+  for (const m of MEASURANDS) {
+    for (let i = recs.length - 1; i >= 0; i--) {
+      if (recs[i][m.key] !== null) { lastGood[m.key] = { v: recs[i][m.key], ts: recs[i].ts }; break; }
+    }
+  }
+  scheduleRender();
+}
+
+async function backfillFromLogs() {
+  if (DEMO || backfillBusy || (backfillDoneAt && Date.now() - backfillDoneAt < BACKFILL_MIN_GAP_MS)) return;
+  backfillBusy = true;
+  try {
+    const res = await fetch('logs/', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`logs/ answered HTTP ${res.status}`);
+    const names = [...new Set((await res.text()).match(/beehive-\d{4}-\d{2}-\d{2}\.log/g) || [])].sort();
+    // Only as many days as the cap can hold. After the first load a reconnect only
+    // needs the gap, so the newest two files are enough.
+    const days = Math.ceil(HISTORY_CAP * settings.intervalMs / 86400000) + 1;
+    const want = names.slice(-(backfillDoneAt ? 2 : days));
+    const texts = await Promise.all(want.map(async (n) => {
+      const r = await fetch('logs/' + n, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`${n} answered HTTP ${r.status}`);
+      return r.text();
+    }));
+    const prefix = $('mqttPrefix').value.trim() || 'beehive/hive01';
+    let logRecs = [], skipped = 0;
+    for (const t of texts) {
+      const p = parseLogToRecords(t, prefix, MqttSource.ASSEMBLY_MS);
+      logRecs = logRecs.concat(p.records); skipped += p.skipped;
+    }
+    logRecs = logRecs.filter(r => r.ts >= historyFloorTs).sort((a, b) => a.ts - b.ts);
+    // No await between reading store.records and replacing it, so a live record can't slip through.
+    const before = store.records.length;
+    const merged = mergeLogRecords(store.records, logRecs, settings.intervalMs / 2);
+    if (merged !== store.records) adoptRecords(merged);
+    backfillDoneAt = Date.now();
+    consoleAdd(`history: ${fmtNum(merged.length - before, 0)} records added from ${want.length} log file(s)` +
+      (skipped ? `, ${skipped} unreadable line(s) skipped` : ''), 'info');
+  } catch (err) {
+    consoleAdd(`history backfill unavailable: ${err.message} (live data only; is dashboard/logs linked to data/?)`, 'info');
+  } finally { backfillBusy = false; }
+}
+
+// ---------- source wiring ----------
+function attachSource(src) {
+  src.addEventListener('record', (e) => onRecord(e.detail));
+  src.addEventListener('frame-error', (e) => {
+    if (e.detail.kind === 'bad-checksum') stats.checksumErr++; else stats.malformed++;
+    scheduleRender();
+  });
+  src.addEventListener('line', (e) => {
+    const { text, dir } = e.detail;
+    if (dir === 'rx') stats.nonFrame++;
+    if (dir === 'frame' && !$('showFrames').checked) return;
+    consoleAdd(text, dir);
+  });
+  src.addEventListener('state', (e) => {
+    const { state, text } = e.detail;
+    // A new link session: frames missed while we were not listening are not
+    // link drops, so the seq baseline restarts.
+    if (state === 'connecting' || state === 'booting') { tracker.reset(); lastRecordTs = null; }
+    setStatePill(state, text);
+    consoleAdd(`[${state}] ${text}`, state === 'error' ? 'err' : 'info');
+    if (state === 'live' && sourceKind === 'mqtt') backfillFromLogs();   // fill the gap a drop left
+    updateControls();
+  });
+  src.addEventListener('meta', (e) => {
+    if (e.detail.key === 'rssi') stats.rssi = e.detail.value;
+    if (e.detail.key === 'gatewayStatus') stats.gatewayStatus = e.detail.value;
+    if (e.detail.key === 'liveTs') { stats.liveTs = e.detail.value; renderAge(); }
+    renderStats();
+  });
+  src.addEventListener('history', (e) => {
+    // Same merge as the log backfill. The wide tolerance keeps a re-fetch after a
+    // stream outage from interleaving 5-min means with live records it already has.
+    const recs = e.detail.records.filter(r => r.ts >= historyFloorTs);
+    const before = store.records.length;
+    const merged = mergeLogRecords(store.records, recs, HIST_MERGE_TOL_MS);
+    if (merged !== store.records) adoptRecords(merged);
+    consoleAdd(`history: ${fmtNum(merged.length - before, 0)} 5-min rollups added` +
+      (e.detail.skipped ? `, ${e.detail.skipped} unreadable bucket(s) skipped` : ''), 'info');
+  });
+}
+
+/** Public mode: "updated 12 s ago" from live.ts, flagged stale past 2 min. */
+function renderAge() {
+  if (!PUBLIC) return;
+  const age = stats.liveTs === null ? null : Date.now() - stats.liveTs;
+  const stale = age === null || age > PUBLIC_STALE_MS;
+  $('ageDot').className = 'dot ' + (age === null ? '' : stale ? 'warning' : 'good');
+  $('ageText').textContent = age === null ? 'no live data yet' : `updated ${fmtAge(age)} ago` + (stale ? ' · stale' : '');
+}
+
+function makeSource(kind) {
+  if (kind === 'serial') return new SerialSource();
+  if (kind === 'sim') return new SimSource(settings.intervalMs);
+  if (kind === 'firebase') return new FirebaseSource(FIREBASE_BASE);
+  if (kind === 'mqtt') {
+    return new MqttSource({
+      url: $('mqttUrl').value.trim(), prefix: $('mqttPrefix').value.trim() || 'beehive/hive01',
+      username: $('mqttUser').value, password: $('mqttPass').value,
+    });
+  }
+  throw new Error(`unknown source ${kind}`);
+}
+
+let sourceKind = null;
+async function onConnectClick() {
+  const kind = $('srcSel').value;
+  try {
+    if (source && sourceKind === kind && kind === 'serial' && source.port) {
+      await source.reconnect();
+      return;
+    }
+    if (source) { await source.disconnect(); source = null; }
+    saveMqttSettings();
+    source = makeSource(kind);
+    sourceKind = kind;
+    // Remember an MQTT session so a reload or browser restart reopens it (see init()).
+    // Serial can't do this: Web Serial needs a user gesture to open a port.
+    if (kind === 'mqtt') localStorage.setItem('hive.autoSource', 'mqtt');
+    attachSource(source);
+    await source.connect();
+  } catch (err) {
+    if (err && err.name === 'NotFoundError') consoleAdd('no port selected', 'info');
+    else { consoleAdd(`connect failed: ${err.message}`, 'err'); showBanner(err.message); }
+    if (source && source.state_ !== 'live' && source.state_ !== 'booting') setStatePill('error', err.message);
+  } finally { updateControls(); }
+}
+async function onDisconnectClick() {
+  localStorage.removeItem('hive.autoSource');   // an explicit Disconnect must survive a reload
+  if (source) await source.disconnect();
+  updateControls();
+}
+
+function isOpen() { return !!source && ['connecting', 'booting', 'live'].includes(source.state_); }
+
+function updateControls() {
+  const open = isOpen();
+  const kind = $('srcSel').value;
+  $('connectBtn').disabled = open;
+  $('connectBtn').textContent = (source && sourceKind === kind && kind === 'serial' && source.port && !open) ? 'Reconnect' : 'Connect…';
+  $('disconnectBtn').disabled = !source || source.state_ === 'disconnected' || !source.state_;
+  const canSend = open && source.canSend;
+  for (const el of [$('cmdInput'), $('cmdSend'), ...document.querySelectorAll('.quick')]) el.disabled = !canSend;
+  $('mqttCfg').hidden = kind !== 'mqtt';
+}
+
+function setStatePill(state, text) {
+  const tone = { live: 'good', booting: 'warning', connecting: 'warning', disconnected: '', error: 'critical' }[state] ?? '';
+  $('srcDot').className = 'dot ' + tone;
+  const icon = { live: '●', booting: '◐', connecting: '◐', disconnected: '○', error: '✕' }[state] ?? '';
+  $('srcText').textContent = `${source ? source.label : ''} · ${icon} ${text}`;
+}
+
+function showBanner(text) { const b = $('banner'); b.textContent = text; b.hidden = !text; }
+
+// ---------- console ----------
+const CONSOLE_MAX = 1000;
+function consoleAdd(text, dir = 'rx') {
+  const box = $('console');
+  const ln = document.createElement('div');
+  ln.className = 'ln ' + dir;
+  const ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = fmtTime(Date.now());
+  ln.append(ts, document.createTextNode(text));   // textContent only: device output is untrusted
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+  box.appendChild(ln);
+  while (box.childElementCount > CONSOLE_MAX) box.firstElementChild.remove();
+  if ($('autoScroll').checked && atBottom) box.scrollTop = box.scrollHeight;
+}
+
+// ---------- tiles & stats ----------
+function buildTiles() {
+  const host = $('tiles');
+  for (const m of MEASURANDS) {
+    const el = document.createElement('div');
+    el.className = 'card tile'; el.id = 'tile-' + m.key;
+    el.innerHTML = `<div class="label"><span class="key" style="background:var(--series-${m.series})"></span><span class="lbl"></span></div>
+      <div class="value"><span class="num">—</span><span class="unit"></span></div><div class="note"></div>`;
+    el.querySelector('.lbl').textContent = m.label;
+    el.querySelector('.unit').textContent = m.unit;
+    host.appendChild(el);
+  }
+}
+
+function renderTiles() {
+  const now = Date.now();
+  for (const m of MEASURANDS) {
+    const el = $('tile-' + m.key);
+    const g = lastGood[m.key];
+    const note = el.querySelector('.note');
+    const isT = TEMP_KEYS.has(m.key);
+    el.querySelector('.unit').textContent = isT ? tempLabel() : m.unit;
+    el.querySelector('.num').textContent = g ? fmtNum(isT ? tempDisp(g.v) : g.v, m.dp) : '—';
+    const age = g ? now - g.ts : null;
+    const stale = g ? age > staleAfterMs() : false;
+    el.classList.toggle('stale', stale);
+    note.replaceChildren();
+    if (!g) { note.textContent = 'No data yet'; continue; }
+    if (stale) note.append(chip('⚠', 'warning', `Stale · last good ${fmtAge(age)} ago`));
+    else if (lastWasNull[m.key]) note.append(chip('⚠', 'serious', `${m.sensor} fail · last good ${fmtAge(age)} ago`));
+    else note.textContent = `Updated ${fmtAge(age)} ago`;
+  }
+}
+
+function chip(icon, tone, text) {
+  const c = document.createElement('span'); c.className = 'chip';
+  const d = document.createElement('span'); d.className = 'dot ' + tone;
+  const i = document.createElement('span'); i.className = 'icon'; i.textContent = icon;
+  const t = document.createElement('span'); t.textContent = text;
+  c.append(d, i, t);
+  return c;
+}
+
+function renderStats() {
+  const now = Date.now();
+  const rows = [
+    ['Frames OK', fmtNum(stats.framesOk, 0)],
+    ['Checksum errors', fmtNum(stats.checksumErr, 0), stats.checksumErr > 0],
+    ['Malformed', fmtNum(stats.malformed, 0), stats.malformed > 0],
+    ['Dropped (seq)', fmtNum(stats.dropped, 0), stats.dropped > 0],
+    ['Reboots', fmtNum(stats.reboots, 0)],
+    ['Seq resyncs', fmtNum(stats.resyncs, 0), stats.resyncs > 0],
+    ['Non-frame lines', fmtNum(stats.nonFrame, 0)],
+    ['Last frame', stats.lastFrameTs ? `${fmtAge(now - stats.lastFrameTs)} ago` : '—', stats.lastFrameTs && now - stats.lastFrameTs > staleAfterMs()],
+  ];
+  if (sourceKind === 'mqtt' || sourceKind === 'firebase') {
+    rows.push(['Gateway', stats.gatewayStatus ?? '—', stats.gatewayStatus === 'offline']);
+    rows.push(['RSSI', stats.rssi === null ? '—' : `${stats.rssi} dBm`]);
+  }
+  // The public feed has no frames, checksums or seq, so those counters would sit at 0.
+  const PUBLIC_ROWS = { 'Frames OK': 'Live updates', 'Reboots': 'Reboots', 'Last frame': 'Last update', 'Gateway': 'Gateway', 'RSSI': 'RSSI' };
+  const shown = PUBLIC ? rows.filter(r => r[0] in PUBLIC_ROWS).map(([k, ...rest]) => [PUBLIC_ROWS[k], ...rest]) : rows;
+  const grid = $('statsGrid');
+  grid.replaceChildren();
+  for (const [k, v, bad] of shown) {
+    const s = document.createElement('div'); s.className = 'stat';
+    const kk = document.createElement('div'); kk.className = 'k'; kk.textContent = k;
+    const vv = document.createElement('div'); vv.className = 'v';
+    if (bad) { vv.classList.add('bad'); vv.append(chip('⚠', 'serious', '')); }
+    vv.append(document.createTextNode(v));
+    s.append(kk, vv); grid.append(s);
+  }
+  $('histCount').textContent = `${fmtNum(store.records.length, 0)} records` + (store.evicted ? ` (${fmtNum(store.evicted, 0)} oldest evicted by cap)` : '');
+}
+
+function renderTable() {
+  const body = $('tableBody');
+  if (!body.closest('details').open) return;   // skip DOM work while collapsed
+  body.replaceChildren();
+  const recs = store.records;
+  for (let i = recs.length - 1; i >= Math.max(0, recs.length - 50); i--) {
+    const r = recs[i];
+    const tr = document.createElement('tr');
+    for (const v of [fmtTime(r.ts), r.seq ?? '—', fmtNum(r.co2, 1), fmtNum(tempDisp(r.tIn), 2), fmtNum(r.rhIn, 1),
+                     fmtNum(tempDisp(r.tOut), 2), fmtNum(r.rhOut, 1), r.rawCounts ?? '—', flagsHex(r.flags)]) {
+      const td = document.createElement('td'); td.textContent = String(v); tr.append(td);
+    }
+    body.append(tr);
+  }
+}
+
+// ---------- charts (uPlot) ----------
+const charts = [];
+const CHART_SPECS = [
+  { el: 'chartScale', cols: [6], names: ['Scale (raw)'], unit: 'counts', dp: 0, slots: [1], empty: [-1000, 1000], axisSize: 78, padRight: 112, tare: true, robust: true },
+  { el: 'chartCo2',  cols: [1],    names: ['CO₂'],               unit: 'ppm', dp: 0, slots: [1],    empty: [400, 3000] },
+  { el: 'chartTemp', cols: [2, 3], names: ['In-hive', 'Ambient'], unit: '°C',  dp: 1, slots: [1, 2], empty: [0, 40], temp: true },
+  { el: 'chartRh',   cols: [4, 5], names: ['In-hive', 'Ambient'], unit: '%',   dp: 0, slots: [1, 2], empty: [0, 100] },
+];
+let chartData = null;
+
+function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim(); }
+
+function viewRange() {
+  const now = Date.now() / 1000;
+  if (settings.rangeS > 0) return [now - settings.rangeS, now];
+  const first = store.records.length ? store.records[0].ts / 1000 : now - 3600;
+  return [first, now];
+}
+
+function buildCharts() {
+  for (const c of charts) c.u.destroy();
+  charts.length = 0;
+  if (typeof uPlot === 'undefined') {
+    for (const spec of CHART_SPECS) {
+      $(spec.el).innerHTML = '<div class="nolib">Chart library failed to load from the CDN (offline?). Tiles, stats and CSV export still work.</div>';
+    }
+    return;
+  }
+  const ink2 = cssVar('--text-secondary'), muted = cssVar('--text-muted'), grid = cssVar('--grid');
+  const surface = cssVar('--surface-1'), reboot = cssVar('--reboot');
+  const px = uPlot.pxRatio;
+
+  for (const spec of CHART_SPECS) {
+    const host = $(spec.el);
+    host.replaceChildren();
+    const tip = document.createElement('div'); tip.className = 'tip';
+    const colors = spec.slots.map(s => cssVar(`--series-${s}`));
+    const state = { hovered: false };
+
+    const axisCommon = {
+      stroke: muted, font: `12px system-ui, -apple-system, "Segoe UI", sans-serif`,
+      grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1, size: 4 },
+    };
+    const opts = {
+      width: host.clientWidth || 600,
+      height: 240,
+      // Right padding leaves room for direct end-labels.
+      padding: [12, spec.padRight || 84, 0, 0],
+      legend: { show: false },
+      cursor: {
+        sync: { key: 'hive' },          // shared crosshair across the three charts
+        drag: { x: false, y: false },   // no drag-zoom: live data would immediately reset it
+        y: false,
+        points: { size: 8, width: 2, stroke: surface },
+      },
+      scales: {
+        x: { time: true, range: () => viewRange() },
+        y: {
+          range: (u, min, max) => {
+            if (spec.robust) { const r = robustRange(u); if (r) return r; }
+            if (min === null || max === null || !Number.isFinite(min)) return emptyRange(spec);
+            return uPlot.rangeNum(min, max, 0.15, true);
+          },
+        },
+      },
+      axes: [
+        { ...axisCommon },
+        { ...axisCommon, size: spec.axisSize || 56, values: (u, ticks) => ticks.map(v => fmtNum(v, Math.abs(v) >= 1000 || spec.dp === 0 ? 0 : spec.dp)) },
+      ],
+      series: [
+        {},
+        ...spec.cols.map((_, i) => ({
+          label: spec.names[i],
+          stroke: colors[i],
+          width: 2,
+          spanGaps: false,     // nulls (sensor fail, link gap) break the line
+          points: { size: 8, width: 2, stroke: surface, fill: colors[i] },   // surface ring
+        })),
+      ],
+      hooks: {
+        draw: [u => drawReboots(u, reboot, muted, px), u => drawEndLabels(u, spec, ink2, px), u => drawTare(u, spec, muted, px)],
+        setCursor: [u => updateTip(u, spec, tip, colors, state)],
+      },
+    };
+    const u = new uPlot(opts, chartSlice(spec), host);
+    u.over.appendChild(tip);
+    u.over.addEventListener('mouseenter', () => { state.hovered = true; });
+    u.over.addEventListener('mouseleave', () => { state.hovered = false; tip.style.display = 'none'; });
+    charts.push({ u, spec, host });
+  }
+}
+
+function chartSlice(spec) {
+  if (!chartData) chartData = buildSeries([], 0, 1);
+  if (spec.temp) return [chartData[0], ...spec.cols.map(c => chartData[c].map(tempDisp))];
+  return [chartData[0], ...spec.cols.map(c => chartData[c])];
+}
+
+// ---------- scale: tare readout (page-local; the firmware sends raw counts only) ----------
+let tareCounts = null;   // raw counts when Tare was pressed; lost on reload by design
+
+function latestRaw() {
+  for (let i = store.records.length - 1; i >= 0; i--) {
+    const v = store.records[i].rawCounts;
+    if (v !== null && v !== undefined) return { v, ts: store.records[i].ts };
+  }
+  return null;
+}
+
+function renderScaleReadout() {
+  const el = $('scaleDelta');
+  if (!el) return;
+  const last = latestRaw();
+  if (!last) { el.textContent = 'No scale data (HX711 absent or flagged)'; return; }
+  const age = Date.now() - last.ts;
+  let t = `${fmtNum(last.v, 0)} counts` + (age > staleAfterMs() ? ` (stale, ${fmtAge(age)} ago)` : '');
+  if (tareCounts === null) t += ' · press Tare to zero the Δ readout';
+  else { const d = last.v - tareCounts; t += ` · Δ since tare ${d >= 0 ? '+' : '−'}${fmtNum(Math.abs(d), 0)} counts`; }
+  el.textContent = t;
+}
+
+// Raw counts include wild stretches (a floating input reads +/-8 million) that would
+// squash the interesting range into a flat line. Fit the axis to the 1st-99th percentile
+// of what is on screen, but ALWAYS include the latest reading (and the tare), so a live
+// press can never fall off the chart. Returns null (fall back to min/max) on sparse data.
+function robustRange(u) {
+  const xs = u.data[0], ys = u.data[1];
+  if (!xs || !ys) return null;
+  const x0 = u.scales.x.min, x1 = u.scales.x.max;
+  const vals = [];
+  let latest = null;
+  for (let i = 0; i < xs.length; i++) {
+    const v = ys[i];
+    if (v === null || v === undefined || xs[i] < x0 || xs[i] > x1) continue;
+    vals.push(v); latest = v;
+  }
+  if (vals.length < 20) return null;
+  vals.sort((a, b) => a - b);
+  const q = (f) => vals[Math.min(vals.length - 1, Math.max(0, Math.round(f * (vals.length - 1))))];
+  let lo = q(0.01), hi = q(0.99);
+  if (latest !== null) { lo = Math.min(lo, latest); hi = Math.max(hi, latest); }
+  if (tareCounts !== null) { lo = Math.min(lo, tareCounts); hi = Math.max(hi, tareCounts); }
+  const pad = Math.max(hi - lo, 400) * 0.15;
+  return [lo - pad, hi + pad];
+}
+
+function drawTare(u, spec, color, px) {
+  if (!spec.tare || tareCounts === null) return;
+  const y = Math.round(u.valToPos(tareCounts, 'y', true)) + 0.5;
+  const { left, width, top, height } = u.bbox;
+  if (y < top || y > top + height) return;     // tare is off the visible scale
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = px; ctx.setLineDash([6 * px, 4 * px]);
+  ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + width, y); ctx.stroke();
+  ctx.setLineDash([]); ctx.fillStyle = color; ctx.font = `${11 * px}px system-ui, sans-serif`; ctx.textAlign = 'left';
+  ctx.fillText('tare', left + 4 * px, y - 3 * px);
+  ctx.restore();
+}
+
+function drawReboots(u, color, labelColor, px) {
+  const ctx = u.ctx;
+  const { top, height } = u.bbox;
+  const min = u.scales.x.min, max = u.scales.x.max;
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = px;
+  ctx.fillStyle = labelColor; ctx.font = `${11 * px}px system-ui, sans-serif`; ctx.textAlign = 'center';
+  for (const ts of store.reboots) {
+    const xs = ts / 1000;
+    if (xs < min || xs > max) continue;
+    const x = Math.round(u.valToPos(xs, 'x', true)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + height); ctx.stroke();
+    ctx.fillText('↻', x, top - 2 * px);
+  }
+  ctx.restore();
+}
+
+function drawEndLabels(u, spec, ink, px) {
+  // Direct labels at each series' last value. If two would collide, draw
+  // neither: nudging detaches labels from their lines; legend + tooltip carry it.
+  const xs = u.data[0];
+  const pts = [];
+  for (let s = 1; s < u.series.length; s++) {
+    const ys = u.data[s];
+    let i = ys.length - 1;
+    while (i >= 0 && ys[i] === null) i--;
+    if (i < 0 || xs[i] < u.scales.x.min) continue;
+    pts.push({ x: u.valToPos(xs[i], 'x', true), y: u.valToPos(ys[i], 'y', true), v: ys[i], name: spec.names[s - 1] });
+  }
+  if (pts.length === 2 && Math.abs(pts[0].y - pts[1].y) < 28 * px) return;
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.fillStyle = ink; ctx.textBaseline = 'middle';
+  for (const p of pts) {
+    const tx = p.x + 8 * px;
+    ctx.font = `600 ${12 * px}px system-ui, sans-serif`;
+    const val = `${fmtNum(p.v, spec.dp)} ${unitOf(spec)}`;
+    if (spec.cols.length === 1) { ctx.fillText(val, tx, p.y); continue; }
+    ctx.fillText(val, tx, p.y - 7 * px);
+    ctx.font = `${11 * px}px system-ui, sans-serif`;
+    ctx.fillText(p.name, tx, p.y + 7 * px);
+  }
+  ctx.restore();
+}
+
+function updateTip(u, spec, tip, colors, state) {
+  const i = u.cursor.idx;
+  if (!state.hovered || i === null || i === undefined || u.cursor.left < 0) { tip.style.display = 'none'; return; }
+  tip.replaceChildren();
+  const t = document.createElement('div'); t.className = 't';
+  t.textContent = new Date(u.data[0][i] * 1000).toLocaleString([], { hour12: false });
+  tip.append(t);
+  spec.cols.forEach((_, k) => {
+    const v = u.data[k + 1][i];
+    const row = document.createElement('div'); row.className = 'row';
+    const key = document.createElement('i'); key.style.background = colors[k];
+    const b = document.createElement('b'); b.textContent = v === null ? 'no data' : `${fmtNum(v, spec.dp + 1)} ${unitOf(spec)}`;
+    const n = document.createElement('span'); n.textContent = spec.names[k];
+    row.append(key, b, n); tip.append(row);
+  });
+  tip.style.display = 'block';
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  const ow = u.over.clientWidth;
+  let left = u.cursor.left + 12;
+  if (left + w > ow) left = u.cursor.left - w - 12;
+  tip.style.left = `${Math.max(0, left)}px`;
+  tip.style.top = `${Math.max(0, (u.cursor.top ?? 0) - h / 2)}px`;
+}
+
+function renderCharts() {
+  if (!charts.length) return;
+  const [from] = viewRange();
+  // Gap threshold matches tile staleness: >3 missed frames breaks the line.
+  // Public mode: 15 min, since its history is 5-min rollups.
+  chartData = buildSeries(store.records, from * 1000, PUBLIC ? PUBLIC_GAP_MS : staleAfterMs());
+  for (const c of charts) c.u.setData(chartSlice(c.spec));
+  renderScaleReadout();
+}
+
+// ---------- render scheduling ----------
+let renderPending = false;
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  // Coalesce bursts (backfill, fast demo) into at most ~4 renders/s.
+  setTimeout(() => { renderPending = false; renderAll(); }, 250);
+}
+function renderAll() { renderTiles(); renderStats(); renderCharts(); renderTable(); }
+
+// ---------- CSV ----------
+function exportCsv() {
+  const blob = new Blob([recordsToCsv(store.records)], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `hive-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+function clearHistory() {
+  if (!confirm('Clear the on-screen history and reset link stats? The log files in data/ are not touched; they reload the next time the page opens.')) return;
+  historyFloorTs = Date.now();   // keep the reconnect backfill from re-adding what was just cleared
+  store.records.length = 0; store.reboots.length = 0; store.evicted = 0;
+  for (const k of Object.keys(stats)) if (typeof stats[k] === 'number') stats[k] = 0;
+  stats.lastFrameTs = null;
+  for (const k of Object.keys(lastGood)) delete lastGood[k];
+  tracker.reset(); lastRecordTs = null;
+  renderAll();
+}
+
+// ---------- settings ----------
+function loadMqttSettings() {
+  $('mqttUrl').value = localStorage.getItem('hive.mqttUrl') || 'ws://localhost:9001';
+  $('mqttPrefix').value = localStorage.getItem('hive.mqttPrefix') || 'beehive/hive01';
+  $('mqttUser').value = localStorage.getItem('hive.mqttUser') || '';
+  // Password deliberately not persisted.
+}
+function saveMqttSettings() {
+  localStorage.setItem('hive.mqttUrl', $('mqttUrl').value.trim());
+  localStorage.setItem('hive.mqttPrefix', $('mqttPrefix').value.trim());
+  localStorage.setItem('hive.mqttUser', $('mqttUser').value);
+}
+
+function applyTheme(mode) {
+  if (mode === 'auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = mode;
+  localStorage.setItem('hive.theme', mode);
+  buildCharts(); renderCharts();   // canvas colours are read from CSS at build time
+}
+
+// ---------- public mode ----------
+// Hiding is done by the body.public-mode CSS rules, so the local page's markup
+// and behaviour are untouched.
+function applyPublicChrome() {
+  document.body.classList.add('public-mode');
+  document.title = 'Hive monitor (live)';
+  document.querySelector('header.top h1').textContent = 'Hive monitor (live)';
+  $('cmdTitle').textContent = 'Console';
+  $('footer').textContent = `Read-only public view. History is 5-minute averages for the last 7 days; ` +
+    `live values follow as the hive sends them. Timestamps are the receive time at the gateway's host. ` +
+    `History is held in this page only; export CSV to keep it.`;
+  renderAge();
+}
+
+async function connectPublic() {
+  sourceKind = 'firebase';
+  source = makeSource('firebase');
+  attachSource(source);
+  try { await source.connect(); } catch (err) {
+    consoleAdd(`connect failed: ${err.message}`, 'err'); showBanner(err.message); setStatePill('error', err.message);
+  }
+}
+
+// ---------- init ----------
+function init() {
+  buildTiles();
+  loadMqttSettings();
+
+  $('themeSel').value = localStorage.getItem('hive.theme') || 'auto';
+  if ($('themeSel').value !== 'auto') document.documentElement.dataset.theme = $('themeSel').value;
+  $('themeSel').addEventListener('change', e => applyTheme(e.target.value));
+
+  const applyUnitLabels = () => {
+    $('tempUnitHead').textContent = tempLabel();
+    for (const el of document.querySelectorAll('.tu')) el.textContent = tempLabel();
+  };
+  $('unitSel').value = tempUnit;
+  applyUnitLabels();
+  $('unitSel').addEventListener('change', e => {
+    tempUnit = e.target.value === 'C' ? 'C' : 'F';
+    localStorage.setItem('hive.tempUnit', tempUnit);
+    applyUnitLabels();
+    buildCharts(); renderAll();   // rebuild so the y-axis rescales to the new unit
+  });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { buildCharts(); renderCharts(); });
+
+  $('intervalSel').value = String(settings.intervalMs);
+  if (!$('intervalSel').value) $('intervalSel').value = '10000';
+  $('intervalSel').addEventListener('change', e => {
+    settings.intervalMs = Number(e.target.value);
+    localStorage.setItem('hive.intervalMs', String(settings.intervalMs));
+    renderAll();
+  });
+
+  for (const b of $('rangeSeg').querySelectorAll('button')) {
+    b.setAttribute('aria-pressed', String(Number(b.dataset.range) === settings.rangeS));
+    b.addEventListener('click', () => {
+      settings.rangeS = Number(b.dataset.range);
+      localStorage.setItem('hive.rangeS', String(settings.rangeS));
+      for (const o of $('rangeSeg').querySelectorAll('button')) o.setAttribute('aria-pressed', String(o === b));
+      renderCharts();
+    });
+  }
+
+  $('srcSel').addEventListener('change', updateControls);
+  $('connectBtn').addEventListener('click', onConnectClick);
+  $('disconnectBtn').addEventListener('click', onDisconnectClick);
+  $('tareBtn').addEventListener('click', () => { const l = latestRaw(); if (l) tareCounts = l.v; renderScaleReadout(); renderCharts(); });
+  $('csvBtn').addEventListener('click', exportCsv);
+  $('clearBtn').addEventListener('click', clearHistory);
+  $('consoleClear').addEventListener('click', () => $('console').replaceChildren());
+  document.querySelector('details:last-of-type').addEventListener('toggle', renderTable);
+
+  const sendCmd = async (text) => {
+    if (!text || !source || !source.canSend) return;
+    source.cancelAutoCommands?.();
+    try { await source.send(text); } catch (err) { consoleAdd(`send failed: ${err.message}`, 'err'); }
+  };
+  $('cmdForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = $('cmdInput').value.trim();
+    $('cmdInput').value = '';
+    sendCmd(v);
+    $('consoleDetails').open = true;   // the reply lands in the console
+  });
+  for (const q of document.querySelectorAll('.quick')) {
+    q.addEventListener('click', () => { sendCmd(q.dataset.cmd); $('consoleDetails').open = true; });
+  }
+
+  $('footer').textContent = `History is capped at ${fmtNum(HISTORY_CAP, 0)} records ` +
+    `(7 days at 10 s, 42 days at 60 s); the oldest are evicted first. On load it is rebuilt from the ` +
+    `mqtt-logger files in data/ when they are reachable (see the console line "history:"); without them it is in ` +
+    `memory only and a reload discards it, so export CSV. Timestamps are host receive time.`;
+
+  if (PUBLIC) {
+    applyPublicChrome();
+  } else if (!SerialSource.supported() && !DEMO) {
+    showBanner('Web Serial is not available in this browser/context. Use Chrome or Edge, opened from file:// or http://localhost. MQTT and ?demo=1 still work.');
+  }
+
+  buildCharts();
+  new ResizeObserver(() => { for (const c of charts) c.u.setSize({ width: c.host.clientWidth, height: 240 }); })
+    .observe(document.querySelector('.charts'));
+
+  // 1 Hz tick: ages and staleness advance without new data; charts slide.
+  let tick = 0;
+  setInterval(() => {
+    renderTiles(); renderStats(); renderAge();
+    if (++tick % 5 === 0) renderCharts();
+  }, 1000);
+
+  if (PUBLIC) {
+    // No backfillFromLogs, no saved MQTT session: the feed is the only source.
+    connectPublic();
+  } else if (DEMO) {
+    $('simOpt').hidden = false;
+    $('srcSel').value = 'sim';
+    onConnectClick();
+  } else {
+    backfillFromLogs();   // history shows even before (or without) a live connection
+  }
+  if (!DEMO && localStorage.getItem('hive.autoSource') === 'mqtt') {
+    // MQTT.js retries a dropped broker link by itself, but a fresh page load has
+    // no client at all, so without this it would sit at "Disconnected" until clicked.
+    // Note: the MQTT password is not persisted, so a broker that requires one will
+    // fail here and need a manual Connect.
+    $('srcSel').value = 'mqtt';
+    onConnectClick();
+  }
+  updateControls();
+  renderAll();
+}
+
+init();
+</script>
+</body>
+</html>
